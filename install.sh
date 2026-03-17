@@ -12,7 +12,10 @@ echo ""
 # --- Step 1: Install the MCP Server ---
 echo "[1/2] Installing MCP Server..."
 if command -v uv &>/dev/null; then
-    uv pip install --system -e "$SCRIPT_DIR" 2>/dev/null || uv pip install -e "$SCRIPT_DIR"
+    if [ ! -d "$SCRIPT_DIR/.venv" ]; then
+        uv venv "$SCRIPT_DIR/.venv"
+    fi
+    uv pip install -e "$SCRIPT_DIR"
     echo "  MCP Server installed via uv."
 elif command -v pip3 &>/dev/null; then
     pip3 install -e "$SCRIPT_DIR"
@@ -26,16 +29,11 @@ fi
 echo ""
 echo "[2/2] Installing Ableton Remote Script..."
 
-# Find all Ableton User Remote Scripts directories
+# Find MIDI Remote Scripts inside Ableton app bundles
 DIRS=()
 while IFS= read -r -d '' dir; do
     DIRS+=("$dir")
-done < <(find "$HOME/Library/Preferences/Ableton" -type d -name "User Remote Scripts" -print0 2>/dev/null)
-
-# Also check Application bundle
-while IFS= read -r -d '' dir; do
-    DIRS+=("$dir")
-done < <(find /Applications -maxdepth 2 -type d -name "MIDI Remote Scripts" -path "*/Ableton*" -print0 2>/dev/null)
+done < <(find /Applications -maxdepth 5 -type d -name "MIDI Remote Scripts" -path "*/Ableton*" -print0 2>/dev/null)
 
 if [ ${#DIRS[@]} -eq 0 ]; then
     echo "  No Ableton installation found."
