@@ -518,10 +518,11 @@ def register(mcp: FastMCP, get_connection, cache):
     async def generate_rhythm_pattern(
         track_index: int,
         clip_index: int,
+        style: str = "house",
         bars: int = 4,
         time_signature: str = "4/4",
     ) -> str:
-        """Generate a drum pattern from trained Markov models and write it directly to a clip.
+        """Generate a drum pattern and write it directly to a clip in Ableton.
 
         ALWAYS use this tool for drums/percussion. Creates the clip and writes
         notes in one step — no need to call create_clip or add_notes_to_clip.
@@ -529,13 +530,41 @@ def register(mcp: FastMCP, get_connection, cache):
         Args:
             track_index: The zero-based index of the drum track.
             clip_index: The zero-based index of the clip slot.
+            style: Drum style. Options: house (four-on-the-floor), rock, hiphop,
+                trap, dnb, reggaeton, bossa_nova, jazz_swing, funk, basic.
+                Default "house".
             bars: Number of bars to generate (1-16). Default 4.
             time_signature: Time signature (e.g. "4/4"). Default "4/4".
         """
         try:
-            notes = generate_from_markov(category="drums", bpm=120, bars=bars)
-            if not notes:
-                return json.dumps({"error": "Markov model returned empty drum pattern. Check that MCP_Server/data/markov_models.json exists."})
+            # Parse time signature
+            parts = time_signature.split("/")
+            beats_per_bar = int(parts[0]) if len(parts) == 2 else 4
+            beat_unit = int(parts[1]) if len(parts) == 2 else 4
+            step_duration = 4.0 / 16  # 0.25 beats per 16th note
+            steps_per_bar = int(beats_per_bar * (16 / beat_unit))
+
+            patterns = _get_drum_pattern(style, steps_per_bar)
+            if patterns is None:
+                return json.dumps({
+                    "error": f"Unknown drum style: {style}",
+                    "available_styles": ["house", "rock", "hiphop", "trap", "dnb",
+                                         "reggaeton", "bossa_nova", "jazz_swing", "funk", "basic"],
+                })
+
+            notes = []
+            for bar in range(bars):
+                bar_offset = bar * beats_per_bar
+                for pitch, hits in patterns.items():
+                    for step, velocity in hits:
+                        start_time = bar_offset + step * step_duration
+                        notes.append({
+                            "pitch": pitch,
+                            "start_time": round(start_time, 4),
+                            "duration": round(step_duration, 4),
+                            "velocity": velocity,
+                            "mute": False,
+                        })
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
 
             # Create clip and write notes directly to Ableton
@@ -554,8 +583,7 @@ def register(mcp: FastMCP, get_connection, cache):
                 "status": "written to Ableton",
                 "track_index": track_index,
                 "clip_index": clip_index,
-                "style": "markov",
-                "source": "trained on 72 real drum MIDI patterns",
+                "style": style,
                 "bars": bars,
                 "total_notes": len(notes),
             }, indent=2)
