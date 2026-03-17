@@ -9,7 +9,8 @@ import random
 from typing import List, Optional
 from mcp.server.fastmcp import FastMCP
 from MCP_Server.tools.pattern_generator import (
-    generate_from_markov,
+    generate_from_patterns,
+    generate_humanized_drums,
 )
 
 logger = logging.getLogger("AbletonMCPServer")
@@ -547,35 +548,11 @@ def register(mcp: FastMCP, get_connection, cache):
         """
         try:
             bars = max(1, min(16, bars))
-            beats_per_bar = 4
-            steps_per_bar = 16
-            step_duration = 0.25
+            notes = generate_humanized_drums(style=style, bars=bars)
+            if not notes:
+                return json.dumps({"error": f"Unknown drum style: {style}. Options: house, rock, hiphop, trap, dnb, reggaeton, bossa_nova, jazz_swing, funk, basic"})
 
-            patterns = _get_drum_pattern(style, steps_per_bar)
-            if patterns is None:
-                return json.dumps({
-                    "error": f"Unknown drum style: {style}",
-                    "available_styles": [
-                        "house", "rock", "hiphop", "trap", "dnb",
-                        "reggaeton", "bossa_nova", "jazz_swing", "funk", "basic",
-                    ],
-                })
-
-            notes = []
-            for bar in range(bars):
-                bar_offset = bar * beats_per_bar
-                for pitch, hits in patterns.items():
-                    for step, velocity in hits:
-                        notes.append({
-                            "pitch": pitch,
-                            "start_time": round(bar_offset + step * step_duration, 4),
-                            "duration": round(step_duration, 4),
-                            "velocity": velocity,
-                            "mute": False,
-                        })
-            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-
-            await _write_to_ableton(track_index, clip_index, notes, bars * beats_per_bar)
+            await _write_to_ableton(track_index, clip_index, notes, bars * 4)
 
             return json.dumps({
                 "status": "written to Ableton",
@@ -614,7 +591,7 @@ def register(mcp: FastMCP, get_connection, cache):
         """
         try:
             bars = max(1, min(16, bars))
-            notes = generate_from_markov(category="bass", key=key, bpm=120, bars=bars)
+            notes = generate_from_patterns(category="bass", key=key, bars=bars, bpm=120)
             if not notes:
                 return json.dumps({
                     "error": "Failed to generate bass pattern. "
@@ -674,7 +651,7 @@ def register(mcp: FastMCP, get_connection, cache):
                 })
 
             bars = max(1, min(16, bars))
-            notes = generate_from_markov(category=category, key=key, bpm=120, bars=bars)
+            notes = generate_from_patterns(category=category, key=key, bars=bars, bpm=120)
             if not notes:
                 return json.dumps({
                     "error": f"Failed to generate {category} pattern. "

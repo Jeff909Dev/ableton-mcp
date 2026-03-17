@@ -759,3 +759,432 @@ def _get_patterns_for_category(index: dict, category: str) -> list:
         return index[category]
 
     return []
+
+
+# ---------------------------------------------------------------------------
+# PatternEngine — Search-Select-Adapt-Vary pipeline using real MIDI patterns
+# ---------------------------------------------------------------------------
+
+class PatternEngine:
+    """Generate music by searching, selecting, adapting, and varying real MIDI patterns."""
+
+    def __init__(self):
+        self._patterns_by_category: Dict[str, List[dict]] = {}
+        self._inferred_keys: Dict[str, str] = {}
+        self._loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+
+        index = _load_index()
+        if index is None:
+            logger.warning("PatternEngine: index.json not found")
+            return
+
+        categories = index.get("categories", {})
+        for cat_name, cat_data in categories.items():
+            if not isinstance(cat_data, dict):
+                continue
+            raw_patterns = cat_data.get("patterns", [])
+            # Filter out corrupt patterns
+            sane = [p for p in raw_patterns if self._is_sane(p)]
+            # Infer keys for patterns without key metadata
+            for p in sane:
+                if not p.get("key"):
+                    inferred = self._infer_key(p)
+                    if inferred:
+                        self._inferred_keys[p.get("id", "")] = inferred
+            self._patterns_by_category[cat_name] = sane
+            logger.info("PatternEngine: %s = %d patterns (%d with key, %d inferred)",
+                        cat_name, len(sane),
+                        sum(1 for p in sane if p.get("key")),
+                        sum(1 for p in sane if p.get("id", "") in self._inferred_keys))
+
+    def _is_sane(self, pattern: dict) -> bool:
+        dur = pattern.get("duration_beats", 0)
+        notes = pattern.get("notes", [])
+        if dur > 500 or len(notes) < 1:
+            return False
+        if notes and max(n.get("start", 0) for n in notes) > 500:
+            return False
+        return True
+
+    def _infer_key(self, pattern: dict) -> Optional[str]:
+        notes = pattern.get("notes", [])
+        if len(notes) < 3:
+            return None
+
+        pc_counts = [0] * 12
+        for n in notes:
+            pc_counts[n["pitch"] % 12] += 1
+
+        major_intervals = [0, 2, 4, 5, 7, 9, 11]
+        minor_intervals = [0, 2, 3, 5, 7, 8, 10]
+
+        best_key = None
+        best_score = -1
+
+        for root in range(12):
+            for intervals, suffix in [(major_intervals, ""), (minor_intervals, "m")]:
+                score = sum(pc_counts[(root + iv) % 12] for iv in intervals)
+                if score > best_score:
+                    best_score = score
+                    best_key = NOTE_NAMES[root] + suffix
+
+        return best_key
+
+    def search_patterns(
+        self,
+        category: str,
+        key: Optional[str] = None,
+        bpm: Optional[int] = None,
+        min_notes: int = 4,
+    ) -> List[dict]:
+        """Search for patterns matching the given criteria. Returns top 10 scored matches."""
+        self._ensure_loaded()
+        patterns = self._patterns_by_category.get(category, [])
+        candidates = [p for p in patterns if len(p.get("notes", [])) >= min_notes]
+
+        if not candidates:
+            return []
+
+        if key is None and bpm is None:
+            return random.Random().sample(candidates, min(10, len(candidates)))
+
+        target_pc = None
+        target_is_minor = False
+        if key is not None:
+            try:
+                target_pc = _note_name_to_pitch_class(key)
+                target_is_minor = key.strip().endswith("m") or "min" in key.lower()
+            except ValueError:
+                target_pc = None
+
+        scored = []
+        for p in candidates:
+            score = 0.0
+
+            # Key scoring (max 10)
+            if target_pc is not None:
+                p_key = p.get("key") or self._inferred_keys.get(p.get("id", ""))
+                if p_key:
+                    try:
+                        p_pc = _note_name_to_pitch_class(p_key)
+                        p_is_minor = p_key.endswith("m")
+                        if p_pc == target_pc and p_is_minor == target_is_minor:
+                            score += 10.0
+                        elif p_pc == target_pc:
+                            score += 7.0
+                        else:
+                            rel_diff = (p_pc - target_pc) % 12
+                            if rel_diff == 3 and target_is_minor and not p_is_minor:
+                                score += 9.0
+                            elif rel_diff == 9 and not target_is_minor and p_is_minor:
+                                score += 9.0
+                            else:
+                                diff = min(rel_diff, 12 - rel_diff)
+                                if diff <= 1:
+                                    score += 6.0
+                                elif diff in (5, 7):
+                                    score += 5.0
+                                elif diff == 2:
+                                    score += 3.0
+                                else:
+                                    score += 1.0
+                    except ValueError:
+                        pass
+                else:
+                    score += 2.0
+
+            # BPM scoring (max 5)
+            if bpm is not None:
+                p_bpm = p.get("bpm")
+                if p_bpm is not None:
+                    try:
+                        diff = abs(float(p_bpm) - bpm)
+                        if diff < 3: score += 5.0
+                        elif diff < 10: score += 4.0
+                        elif diff < 20: score += 3.0
+                        elif diff < 40: score += 1.0
+                    except (ValueError, TypeError):
+                        pass
+
+            # Note richness (max 2)
+            score += min(len(p.get("notes", [])) / 20.0, 2.0)
+
+            scored.append((score, p))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in scored[:10]]
+
+    def pick_pattern(self, matches: List[dict], seed: Optional[int] = None) -> dict:
+        """Pick one pattern from matches with weighted randomness (better scores more likely)."""
+        if not matches:
+            raise ValueError("No patterns to pick from")
+        if len(matches) == 1:
+            return matches[0]
+
+        rng = random.Random(seed)
+        n = len(matches)
+        weights = [max(0.5, 10.0 - i * 1.2) for i in range(n)]
+        total = sum(weights)
+        r = rng.random() * total
+        cumulative = 0.0
+        for i, w in enumerate(weights):
+            cumulative += w
+            if r <= cumulative:
+                return matches[i]
+        return matches[-1]
+
+    def adapt_pattern(
+        self,
+        pattern: dict,
+        target_key: str,
+        target_bars: int,
+        target_bpm: Optional[int] = None,
+    ) -> List[dict]:
+        """Adapt a real pattern: transpose to key, loop/truncate to bars, convert to Ableton format."""
+        notes = pattern.get("notes", [])
+        if not notes:
+            return []
+
+        # Normalize timing (shift so first note starts at beat 0)
+        min_start = min(n.get("start", 0) for n in notes)
+        normalized = []
+        for n in notes:
+            normalized.append({
+                "pitch": n["pitch"],
+                "start": n.get("start", 0) - min_start,
+                "duration": n["duration"],
+                "velocity": n["velocity"],
+            })
+
+        # Determine source pattern length in bars
+        pattern_duration = pattern.get("duration_beats", 0)
+        if pattern_duration <= 0 or pattern_duration > 500:
+            last_end = max(n["start"] + n["duration"] for n in normalized)
+            pattern_duration = last_end
+        else:
+            pattern_duration = pattern_duration - min_start
+
+        pattern_bars = max(1, int((pattern_duration + 3.99) // 4))
+        pattern_beats = pattern_bars * 4
+
+        # Transpose to target key
+        source_key = pattern.get("key") or self._inferred_keys.get(pattern.get("id", ""))
+        if source_key and target_key:
+            try:
+                from_pc = _note_name_to_pitch_class(source_key)
+                to_pc = _note_name_to_pitch_class(target_key)
+                shift = to_pc - from_pc
+                for n in normalized:
+                    new_pitch = n["pitch"] + shift
+                    while new_pitch < 0:
+                        new_pitch += 12
+                    while new_pitch > 127:
+                        new_pitch -= 12
+                    n["pitch"] = new_pitch
+            except ValueError:
+                pass
+
+        # Loop or truncate to target_bars
+        target_beats = target_bars * 4
+        result = []
+
+        if pattern_beats >= target_beats:
+            for n in normalized:
+                if n["start"] < target_beats:
+                    note = dict(n)
+                    if note["start"] + note["duration"] > target_beats:
+                        note["duration"] = target_beats - note["start"]
+                    result.append(note)
+        else:
+            repetitions = (target_beats + pattern_beats - 1) // pattern_beats
+            for rep in range(repetitions):
+                offset = rep * pattern_beats
+                for n in normalized:
+                    new_start = n["start"] + offset
+                    if new_start >= target_beats:
+                        continue
+                    note = dict(n)
+                    note["start"] = new_start
+                    if note["start"] + note["duration"] > target_beats:
+                        note["duration"] = target_beats - note["start"]
+                    result.append(note)
+
+        # Convert to Ableton format
+        ableton_notes = []
+        for n in result:
+            ableton_notes.append({
+                "pitch": n["pitch"],
+                "start_time": round(n["start"], 4),
+                "duration": round(max(n["duration"], 0.01), 4),
+                "velocity": max(1, min(127, n["velocity"])),
+                "mute": False,
+            })
+
+        ableton_notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+        return ableton_notes
+
+    def vary_pattern(
+        self,
+        notes: List[dict],
+        amount: float = 0.3,
+        seed: Optional[int] = None,
+    ) -> List[dict]:
+        """Apply subtle humanization: velocity variation, micro-timing, occasional omission."""
+        if not notes or amount <= 0:
+            return list(notes)
+
+        rng = random.Random(seed)
+        amount = max(0.0, min(1.0, amount))
+        result = []
+
+        for note in notes:
+            if rng.random() < amount * 0.1:
+                continue
+
+            new_note = dict(note)
+
+            vel_range = int(amount * 20)
+            if vel_range > 0:
+                new_note["velocity"] = max(1, min(127,
+                    note["velocity"] + rng.randint(-vel_range, vel_range)))
+
+            timing_range = amount * 0.05
+            if timing_range > 0:
+                new_note["start_time"] = round(max(0.0,
+                    note["start_time"] + rng.uniform(-timing_range, timing_range)), 4)
+
+            dur_factor = 1.0 + rng.uniform(-amount * 0.1, amount * 0.1)
+            new_note["duration"] = round(max(0.01, note["duration"] * dur_factor), 4)
+
+            result.append(new_note)
+
+        result.sort(key=lambda n: (n["start_time"], n["pitch"]))
+        return result
+
+    def generate(
+        self,
+        category: str,
+        key: str = "C",
+        bars: int = 4,
+        bpm: Optional[int] = None,
+        variation: float = 0.3,
+        seed: Optional[int] = None,
+    ) -> List[dict]:
+        """Generate by searching real patterns, picking one, adapting it, and varying it."""
+        bars = max(1, min(16, bars))
+
+        matches = self.search_patterns(category, key=key, bpm=bpm)
+        if not matches:
+            matches = self.search_patterns(category, bpm=bpm, min_notes=2)
+        if not matches:
+            logger.warning("PatternEngine: no patterns found for %s, using fallback", category)
+            rng = random.Random(seed)
+            return _fallback_melodic(key, bpm or 120, bars, category, rng)
+
+        pattern = self.pick_pattern(matches, seed=seed)
+        notes = self.adapt_pattern(pattern, target_key=key, target_bars=bars, target_bpm=bpm)
+
+        if variation > 0:
+            vary_seed = (seed * 31 + 7) if seed is not None else None
+            notes = self.vary_pattern(notes, amount=variation, seed=vary_seed)
+
+        return notes
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton and public API
+# ---------------------------------------------------------------------------
+
+_engine: Optional[PatternEngine] = None
+
+
+def _get_engine() -> PatternEngine:
+    global _engine
+    if _engine is None:
+        _engine = PatternEngine()
+    return _engine
+
+
+def generate_from_patterns(
+    category: str,
+    key: str = "C",
+    bars: int = 4,
+    bpm: Optional[int] = None,
+    variation: float = 0.3,
+    seed: Optional[int] = None,
+) -> List[dict]:
+    """Generate a MIDI pattern using the search-select-adapt-vary pipeline.
+
+    Uses real MIDI patterns from the library instead of generating from scratch.
+    Drop-in replacement for generate_from_markov.
+    """
+    return _get_engine().generate(category, key, bars, bpm, variation, seed)
+
+
+def generate_humanized_drums(
+    style: str,
+    bars: int = 4,
+    humanize: float = 0.3,
+    seed: Optional[int] = None,
+) -> List[dict]:
+    """Generate drums from templates with velocity humanization and micro-variation."""
+    # Import here to avoid circular imports
+    from MCP_Server.tools.ai_tools import _get_drum_pattern
+
+    rng = random.Random(seed)
+    bars = max(1, min(16, bars))
+    beats_per_bar = 4
+    steps_per_bar = 16
+    step_duration = 0.25
+
+    raw_patterns = _get_drum_pattern(style, steps_per_bar)
+    if raw_patterns is None:
+        return _fallback_drums(120, bars, rng)
+
+    notes = []
+    for bar in range(bars):
+        bar_offset = bar * beats_per_bar
+        for pitch, hits in raw_patterns.items():
+            for step, base_velocity in hits:
+                start = bar_offset + step * step_duration
+
+                vel_range = int(humanize * 20)
+                vel = base_velocity + rng.randint(-vel_range, vel_range)
+                vel = max(1, min(127, vel))
+
+                timing_range = humanize * 0.04
+                time_delta = rng.uniform(-timing_range, timing_range)
+                start = max(0.0, start + time_delta)
+
+                # Ghost note injection
+                ghost_prob = humanize * 0.08
+                if rng.random() < ghost_prob and step > 0:
+                    ghost_start = start - step_duration
+                    if ghost_start >= bar_offset:
+                        notes.append({
+                            "pitch": pitch,
+                            "start_time": round(ghost_start, 4),
+                            "duration": round(step_duration, 4),
+                            "velocity": max(1, base_velocity // 3),
+                            "mute": False,
+                        })
+
+                # Occasional note skip
+                if rng.random() < humanize * 0.05:
+                    continue
+
+                notes.append({
+                    "pitch": pitch,
+                    "start_time": round(start, 4),
+                    "duration": round(step_duration, 4),
+                    "velocity": vel,
+                    "mute": False,
+                })
+
+    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+    return notes
