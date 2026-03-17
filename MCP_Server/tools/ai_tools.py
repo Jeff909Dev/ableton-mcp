@@ -8,6 +8,11 @@ import logging
 import random
 from typing import List, Optional
 from mcp.server.fastmcp import FastMCP
+from MCP_Server.tools.pattern_generator import (
+    generate_from_markov,
+    find_similar_pattern,
+    transpose_pattern,
+)
 
 logger = logging.getLogger("AbletonMCPServer")
 
@@ -158,9 +163,18 @@ def _midi_to_name(midi: int) -> str:
 
 
 def _note_name_to_pitch_class(name: str) -> int:
-    """Convert a bare note name (no octave) like 'C', 'F#', 'Bb' to pitch class 0-11."""
+    """Convert a note name like 'C', 'F#', 'Bb', 'Am', 'C#m' to pitch class 0-11.
+
+    Strips trailing mode suffixes (m, min, maj, minor, major) and octave digits.
+    """
+    import re
     name = name.strip()
-    name_upper = name[0].upper() + name[1:]
+    # Strip mode suffixes and octave digits
+    cleaned = re.sub(r'(minor|major|min|maj|m)$', '', name, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\d+$', '', cleaned).strip()
+    if not cleaned:
+        raise ValueError(f"Empty note name after cleaning: {name}")
+    name_upper = cleaned[0].upper() + cleaned[1:]
     if "b" in name_upper:
         if name_upper in FLAT_TO_SHARP:
             name_upper = FLAT_TO_SHARP[name_upper]
@@ -502,7 +516,7 @@ def register(mcp: FastMCP, get_connection, cache):
     # ------------------------------------------------------------------
     @mcp.tool()
     async def generate_rhythm_pattern(
-        style: str = "basic",
+        style: str = "markov",
         bars: int = 1,
         time_signature: str = "4/4",
     ) -> str:
@@ -513,13 +527,34 @@ def register(mcp: FastMCP, get_connection, cache):
         tom_low=43, tom_mid=47, tom_hi=50, crash=49, ride=51.
 
         Args:
-            style: Pattern style. Options: basic, rock, hiphop, trap, house,
-                dnb, reggaeton, bossa_nova, jazz_swing, funk.
+            style: Pattern style. Options: markov (learned from real MIDI patterns — recommended),
+                basic, rock, hiphop, trap, house, dnb, reggaeton, bossa_nova, jazz_swing, funk.
             bars: Number of bars to generate (1-8). Default 1.
             time_signature: Time signature as "numerator/denominator" (e.g. "4/4").
                 Default "4/4".
         """
         try:
+            # Markov-based generation from trained MIDI patterns
+            if style == "markov":
+                try:
+                    notes = generate_from_markov(
+                        category="drums", bpm=120, bars=bars
+                    )
+                    if not notes:
+                        raise ValueError("Markov model returned empty drum pattern")
+                    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+                    return json.dumps({
+                        "style": "markov",
+                        "source": "trained on 72 real drum MIDI patterns",
+                        "bars": bars,
+                        "time_signature": time_signature,
+                        "total_beats": bars * 4,
+                        "drum_map": GM_DRUMS,
+                        "notes": notes,
+                    }, indent=2)
+                except Exception as e:
+                    logger.warning(f"Markov drums failed, falling back to basic: {e}")
+                    style = "basic"
             # Parse time signature
             parts = time_signature.split("/")
             if len(parts) != 2:
@@ -582,7 +617,7 @@ def register(mcp: FastMCP, get_connection, cache):
         scale_type: str = "minor_pentatonic",
         chord_progression: str = "i-iv-VII-v",
         bars: int = 4,
-        style: str = "basic",
+        style: str = "markov",
         octave: int = 2,
     ) -> str:
         """Generate a bassline that follows a chord progression.
@@ -595,9 +630,10 @@ def register(mcp: FastMCP, get_connection, cache):
             chord_progression: Dash-separated Roman numerals or a preset name.
                 Default "i-iv-VII-v".
             bars: Number of bars to generate. Default 4.
-            style: Bassline style. Options: basic (root notes on each beat),
-                walking (jazz walking bass), octave (root + octave pattern),
-                arpeggiated (chord arpeggios), syncopated (offbeat rhythms).
+            style: Bassline style. Options: markov (learned from real MIDI patterns — recommended),
+                basic (root notes on each beat), walking (jazz walking bass),
+                octave (root + octave pattern), arpeggiated (chord arpeggios),
+                syncopated (offbeat rhythms). Default "markov".
             octave: MIDI octave for the bass (0-3). Default 2.
         """
         try:
@@ -631,6 +667,29 @@ def register(mcp: FastMCP, get_connection, cache):
             rng = random.Random(42)  # Deterministic seed for reproducibility
             notes = []
             beats_per_bar = 4
+
+            # Markov-based generation from trained MIDI patterns
+            if style == "markov":
+                try:
+                    notes = generate_from_markov(
+                        category="bass", key=key, bpm=120, bars=bars
+                    )
+                    if not notes:
+                        raise ValueError("Markov model returned empty pattern")
+                    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+                    return json.dumps({
+                        "key": NOTE_NAMES[key_pc],
+                        "scale_type": scale_type,
+                        "chord_progression": prog_str,
+                        "style": "markov",
+                        "source": "trained on 391 real bass MIDI patterns",
+                        "bars": bars,
+                        "total_beats": bars * beats_per_bar,
+                        "notes": notes,
+                    }, indent=2)
+                except Exception as e:
+                    logger.warning(f"Markov bass failed, falling back to basic: {e}")
+                    style = "basic"
 
             for bar_idx, (root_pc, quality, chord_ivs) in enumerate(bar_chords):
                 bar_offset = bar_idx * beats_per_bar
@@ -757,12 +816,11 @@ def register(mcp: FastMCP, get_connection, cache):
         bars: int = 4,
         octave: int = 5,
         density: str = "medium",
-        style: str = "simple",
+        style: str = "markov",
     ) -> str:
-        """Generate a simple melody within a scale.
+        """Generate a melody within a scale.
 
-        Produces MIDI notes ready for add_notes_to_clip. Uses musical heuristics:
-        stepwise motion preferred, occasional leaps, tendency to resolve to tonic.
+        Produces MIDI notes ready for add_notes_to_clip.
 
         Args:
             key: Root note of the key (e.g. "C", "F#", "Bb").
@@ -771,10 +829,33 @@ def register(mcp: FastMCP, get_connection, cache):
             octave: MIDI octave for the melody. Default 5.
             density: Note density. Options: sparse (few long notes), medium
                 (quarter/eighth mix), dense (mostly eighth/sixteenth notes).
-            style: Melodic style. Options: simple (mixed rhythms), arpeggiated
-                (chord-tone focused), stepwise (mostly scale steps).
+            style: Melodic style. Options: markov (learned from real MIDI patterns — recommended),
+                simple (mixed rhythms), arpeggiated (chord-tone focused),
+                stepwise (mostly scale steps).
         """
         try:
+            # Markov-based generation from trained MIDI patterns
+            if style == "markov":
+                try:
+                    notes = generate_from_markov(
+                        category="melody", key=key, bpm=120, bars=bars
+                    )
+                    if not notes:
+                        raise ValueError("Markov model returned empty melody")
+                    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+                    return json.dumps({
+                        "key": key,
+                        "scale_type": scale_type,
+                        "style": "markov",
+                        "source": "trained on real MIDI melody patterns",
+                        "bars": bars,
+                        "total_beats": bars * 4,
+                        "notes": notes,
+                    }, indent=2)
+                except Exception as e:
+                    logger.warning(f"Markov melody failed, falling back to simple: {e}")
+                    style = "simple"
+
             if scale_type not in SCALE_INTERVALS:
                 return json.dumps({
                     "error": f"Unknown scale type: {scale_type}",

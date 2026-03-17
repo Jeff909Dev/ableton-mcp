@@ -9,3 +9,5 @@ wheels/
 # Virtual environments
 .venv
 .DS_Store
+# Regenerable files (run scripts to rebuild)
+midi_patterns/index.json

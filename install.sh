@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AbletonMCP Installer
-# Installs both the MCP Server and the Ableton Remote Script
+# Installs the MCP Server, builds pattern models, and installs the Ableton Remote Script
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -10,7 +10,7 @@ echo "=== AbletonMCP Installer ==="
 echo ""
 
 # --- Step 1: Install the MCP Server ---
-echo "[1/2] Installing MCP Server..."
+echo "[1/3] Installing MCP Server..."
 if command -v uv &>/dev/null; then
     if [ ! -d "$SCRIPT_DIR/.venv" ]; then
         uv venv "$SCRIPT_DIR/.venv"
@@ -25,9 +25,52 @@ else
     exit 1
 fi
 
-# --- Step 2: Install the Remote Script into Ableton ---
+# --- Step 2: Build MIDI pattern models (if not already built) ---
 echo ""
-echo "[2/2] Installing Ableton Remote Script..."
+echo "[2/3] Building MIDI pattern models..."
+
+# Determine which Python to use
+if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PY="$SCRIPT_DIR/.venv/bin/python"
+elif command -v python3 &>/dev/null; then
+    PY="python3"
+else
+    PY="python"
+fi
+
+# Install mido if not present
+$PY -c "import mido" 2>/dev/null || $PY -m pip install mido -q
+
+MODELS_SRC="$SCRIPT_DIR/midi_patterns/markov_models.json"
+MODELS_PKG="$SCRIPT_DIR/MCP_Server/data/markov_models.json"
+
+if [ -f "$MODELS_SRC" ]; then
+    echo "  Markov models found (midi_patterns/markov_models.json)."
+    echo "  To rebuild: $PY scripts/build_pattern_index.py && $PY scripts/build_markov_models.py"
+else
+    # Need to build from MIDI files
+    if ls "$SCRIPT_DIR/midi_patterns/"*/*.mid 1>/dev/null 2>&1; then
+        echo "  Building pattern index from MIDI files..."
+        $PY "$SCRIPT_DIR/scripts/build_pattern_index.py"
+        echo "  Training Markov models..."
+        $PY "$SCRIPT_DIR/scripts/build_markov_models.py"
+    else
+        echo "  WARNING: No MIDI patterns found and no pre-built models."
+        echo "  Pattern generation will use fallback templates."
+        echo "  To add patterns: place .mid files in midi_patterns/{bass,drums,synth,...}/"
+    fi
+fi
+
+# Copy models into the Python package so the server is self-contained
+if [ -f "$MODELS_SRC" ]; then
+    mkdir -p "$SCRIPT_DIR/MCP_Server/data"
+    cp "$MODELS_SRC" "$MODELS_PKG"
+    echo "  Models bundled into MCP_Server/data/ for self-contained operation."
+fi
+
+# --- Step 3: Install the Remote Script into Ableton ---
+echo ""
+echo "[3/3] Installing Ableton Remote Script..."
 
 # Find MIDI Remote Scripts inside Ableton app bundles
 DIRS=()
