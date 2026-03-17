@@ -534,8 +534,11 @@ def register(mcp: FastMCP, get_connection, cache):
         """Generate a drum/percussion pattern and write it to Ableton in one step.
 
         USE THIS for any request involving drums, beats, rhythm, percussion, or
-        groove. Creates the clip, generates the pattern, and writes it — nothing
-        else needed. Do NOT use add_notes_to_clip for drums.
+        groove. Creates the clip, generates the pattern, and writes it.
+
+        IMPORTANT: Before calling this, make sure the target track has a drum
+        instrument loaded (e.g. 909 Core Kit, Drum Rack). Use browse_instruments
+        or load_instrument_or_effect first if the track is empty.
 
         Styles: house (four-on-the-floor), rock, hiphop, trap, dnb, reggaeton,
         bossa_nova, jazz_swing, funk, basic.
@@ -579,9 +582,12 @@ def register(mcp: FastMCP, get_connection, cache):
         """Generate a bassline and write it to Ableton in one step.
 
         USE THIS for any request involving bass, bassline, sub bass, or low-end.
-        Trained on 391 real bass MIDI patterns from professional sample packs.
-        Creates the clip, generates the pattern, and writes it — nothing else
-        needed. Do NOT use add_notes_to_clip for bass.
+        Uses real bass MIDI patterns from professional sample packs.
+        Creates the clip, generates the pattern, and writes it.
+
+        IMPORTANT: Before calling this, make sure the target track has a bass
+        instrument loaded (e.g. Analog, Operator, Wavetable). Use browse_instruments
+        or load_instrument_or_effect first if the track is empty.
 
         Args:
             track_index: Zero-based index of the bass track.
@@ -628,9 +634,12 @@ def register(mcp: FastMCP, get_connection, cache):
 
         USE THIS for any request involving melody, synth, keys/piano, chords,
         pads, leads, arpeggios, or any pitched instrument that is not bass.
-        Trained on hundreds of real MIDI patterns from professional sample packs.
-        Creates the clip, generates the pattern, and writes it — nothing else
-        needed. Do NOT use add_notes_to_clip for melodies.
+        Uses real MIDI patterns from professional sample packs.
+        Creates the clip, generates the pattern, and writes it.
+
+        IMPORTANT: Before calling this, make sure the target track has an
+        instrument loaded (e.g. Analog, Wavetable, Piano). Use browse_instruments
+        or load_instrument_or_effect first if the track is empty.
 
         Categories: synth (251 patterns), keys (155 patterns), chords (96 patterns),
         pads (50 patterns), melody (27 patterns).
