@@ -534,27 +534,22 @@ def register(mcp: FastMCP, get_connection, cache):
                 Default "4/4".
         """
         try:
-            # Markov-based generation from trained MIDI patterns
-            if style == "markov":
-                try:
-                    notes = generate_from_markov(
-                        category="drums", bpm=120, bars=bars
-                    )
-                    if not notes:
-                        raise ValueError("Markov model returned empty drum pattern")
-                    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-                    return json.dumps({
-                        "style": "markov",
-                        "source": "trained on 72 real drum MIDI patterns",
-                        "bars": bars,
-                        "time_signature": time_signature,
-                        "total_beats": bars * 4,
-                        "drum_map": GM_DRUMS,
-                        "notes": notes,
-                    }, indent=2)
-                except Exception as e:
-                    logger.warning(f"Markov drums failed, falling back to basic: {e}")
-                    style = "basic"
+            # Always use Markov-based generation from trained MIDI patterns
+            notes = generate_from_markov(
+                category="drums", bpm=120, bars=bars
+            )
+            if not notes:
+                return json.dumps({"error": "Markov model returned empty drum pattern. Check that MCP_Server/data/markov_models.json exists."})
+            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+            return json.dumps({
+                "style": "markov",
+                "source": "trained on 72 real drum MIDI patterns",
+                "bars": bars,
+                "time_signature": time_signature,
+                "total_beats": bars * 4,
+                "drum_map": GM_DRUMS,
+                "notes": notes,
+            }, indent=2)
             # Parse time signature
             parts = time_signature.split("/")
             if len(parts) != 2:
@@ -668,28 +663,23 @@ def register(mcp: FastMCP, get_connection, cache):
             notes = []
             beats_per_bar = 4
 
-            # Markov-based generation from trained MIDI patterns
-            if style == "markov":
-                try:
-                    notes = generate_from_markov(
-                        category="bass", key=key, bpm=120, bars=bars
-                    )
-                    if not notes:
-                        raise ValueError("Markov model returned empty pattern")
-                    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-                    return json.dumps({
-                        "key": NOTE_NAMES[key_pc],
-                        "scale_type": scale_type,
-                        "chord_progression": prog_str,
-                        "style": "markov",
-                        "source": "trained on 391 real bass MIDI patterns",
-                        "bars": bars,
-                        "total_beats": bars * beats_per_bar,
-                        "notes": notes,
-                    }, indent=2)
-                except Exception as e:
-                    logger.warning(f"Markov bass failed, falling back to basic: {e}")
-                    style = "basic"
+            # Always use Markov-based generation from trained MIDI patterns
+            notes = generate_from_markov(
+                category="bass", key=key, bpm=120, bars=bars
+            )
+            if not notes:
+                return json.dumps({"error": "Markov model returned empty bass pattern. Check that MCP_Server/data/markov_models.json exists."})
+            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+            return json.dumps({
+                "key": NOTE_NAMES[key_pc],
+                "scale_type": scale_type,
+                "chord_progression": prog_str,
+                "style": "markov",
+                "source": "trained on 391 real bass MIDI patterns",
+                "bars": bars,
+                "total_beats": bars * beats_per_bar,
+                "notes": notes,
+            }, indent=2)
 
             for bar_idx, (root_pc, quality, chord_ivs) in enumerate(bar_chords):
                 bar_offset = bar_idx * beats_per_bar
@@ -834,27 +824,22 @@ def register(mcp: FastMCP, get_connection, cache):
                 stepwise (mostly scale steps).
         """
         try:
-            # Markov-based generation from trained MIDI patterns
-            if style == "markov":
-                try:
-                    notes = generate_from_markov(
-                        category="melody", key=key, bpm=120, bars=bars
-                    )
-                    if not notes:
-                        raise ValueError("Markov model returned empty melody")
-                    notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-                    return json.dumps({
-                        "key": key,
-                        "scale_type": scale_type,
-                        "style": "markov",
-                        "source": "trained on real MIDI melody patterns",
-                        "bars": bars,
-                        "total_beats": bars * 4,
-                        "notes": notes,
-                    }, indent=2)
-                except Exception as e:
-                    logger.warning(f"Markov melody failed, falling back to simple: {e}")
-                    style = "simple"
+            # Always use Markov-based generation from trained MIDI patterns
+            notes = generate_from_markov(
+                category="melody", key=key, bpm=120, bars=bars
+            )
+            if not notes:
+                return json.dumps({"error": "Markov model returned empty melody. Check that MCP_Server/data/markov_models.json exists."})
+            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+            return json.dumps({
+                "key": key,
+                "scale_type": scale_type,
+                "style": "markov",
+                "source": "trained on real MIDI melody patterns",
+                "bars": bars,
+                "total_beats": bars * 4,
+                "notes": notes,
+            }, indent=2)
 
             if scale_type not in SCALE_INTERVALS:
                 return json.dumps({
