@@ -42,28 +42,27 @@ def register(mcp: FastMCP, get_connection, cache):
         clip_index: int,
         notes: List[Dict[str, Union[int, float, bool]]],
     ) -> str:
-        """Add MIDI notes to an existing clip. Low-level tool.
+        """Low-level: add raw MIDI notes to an existing clip.
 
-        WARNING: You almost certainly should NOT call this directly. Use these
-        tools instead — they generate AND write notes in one step:
-        - generate_rhythm_pattern(track_index, clip_index, bars) → drums
-        - generate_bassline(track_index, clip_index, key, bars) → bass
-        - generate_melody(track_index, clip_index, key, category, bars) → synth/keys/pads/melody
-        Those tools create the clip, generate Markov-trained patterns, and write
-        them to Ableton automatically. Only use add_notes_to_clip for appending
-        extra notes to an existing clip.
+        STOP — before using this tool, consider these alternatives that produce
+        much better results:
+        - generate_drums → drum/percussion patterns (10 genre styles)
+        - generate_bassline → bass patterns (trained on 391 real MIDI files)
+        - generate_melody → synth/keys/chords/pads/melody (trained on 500+ MIDI files)
 
-        Each note is a dictionary with the following keys:
-            pitch: MIDI note number (0-127).
-            start_time: Note start position in beats.
-            duration: Note length in beats.
-            velocity: Note velocity (0-127).
-            mute: Whether the note is muted (bool).
+        Those tools create the clip AND write professionally-generated patterns in
+        one step. Only use add_notes_to_clip if you need to:
+        1. Append additional notes to an existing clip
+        2. Write a very specific, user-dictated note sequence
+        3. Layer notes on top of a generated pattern
+
+        Each note dict: {pitch: int, start_time: float, duration: float,
+        velocity: int, mute: bool}.
 
         Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
-            notes: A list of note dictionaries to add.
+            track_index: Zero-based index of the track.
+            clip_index: Zero-based index of the clip slot.
+            notes: List of note dictionaries.
         """
         try:
             conn = await get_connection()

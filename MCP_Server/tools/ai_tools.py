@@ -10,8 +10,6 @@ from typing import List, Optional
 from mcp.server.fastmcp import FastMCP
 from MCP_Server.tools.pattern_generator import (
     generate_from_markov,
-    find_similar_pattern,
-    transpose_pattern,
 )
 
 logger = logging.getLogger("AbletonMCPServer")
@@ -281,6 +279,17 @@ def _parse_roman_numeral(numeral: str, key_pc: int, mode: str):
 def register(mcp: FastMCP, get_connection, cache):
     """Register AI/music theory tools with the MCP server"""
 
+    async def _write_to_ableton(track_index, clip_index, notes, clip_length):
+        """Create a clip and write notes to Ableton in one step."""
+        conn = await get_connection()
+        await conn.send_command("create_clip", {
+            "track_index": track_index, "clip_index": clip_index, "length": clip_length,
+        })
+        await conn.send_command("add_notes_to_clip", {
+            "track_index": track_index, "clip_index": clip_index, "notes": notes,
+        })
+        cache.invalidate_all()
+
     # ------------------------------------------------------------------
     # 1. note_name_to_midi
     # ------------------------------------------------------------------
@@ -453,7 +462,7 @@ def register(mcp: FastMCP, get_connection, cache):
         """Generate a chord progression using Roman numeral notation.
 
         Uppercase numerals = major chords, lowercase = minor chords.
-        Append degree sign for diminished (e.g. "vii°").
+        Append degree sign for diminished (e.g. "vii\u00b0").
 
         Preset progressions (pass as the progression argument):
         pop = I-V-vi-IV, jazz_251 = ii-V-I, blues = I-I-I-I-IV-IV-I-I-V-IV-I-V,
@@ -512,44 +521,44 @@ def register(mcp: FastMCP, get_connection, cache):
             return json.dumps({"error": str(e)})
 
     # ------------------------------------------------------------------
-    # 6. generate_rhythm_pattern
+    # 6. generate_drums
     # ------------------------------------------------------------------
     @mcp.tool()
-    async def generate_rhythm_pattern(
+    async def generate_drums(
         track_index: int,
         clip_index: int,
         style: str = "house",
         bars: int = 4,
-        time_signature: str = "4/4",
     ) -> str:
-        """Generate a drum pattern and write it directly to a clip in Ableton.
+        """Generate a drum/percussion pattern and write it to Ableton in one step.
 
-        ALWAYS use this tool for drums/percussion. Creates the clip and writes
-        notes in one step — no need to call create_clip or add_notes_to_clip.
+        USE THIS for any request involving drums, beats, rhythm, percussion, or
+        groove. Creates the clip, generates the pattern, and writes it — nothing
+        else needed. Do NOT use add_notes_to_clip for drums.
+
+        Styles: house (four-on-the-floor), rock, hiphop, trap, dnb, reggaeton,
+        bossa_nova, jazz_swing, funk, basic.
 
         Args:
-            track_index: The zero-based index of the drum track.
-            clip_index: The zero-based index of the clip slot.
-            style: Drum style. Options: house (four-on-the-floor), rock, hiphop,
-                trap, dnb, reggaeton, bossa_nova, jazz_swing, funk, basic.
-                Default "house".
-            bars: Number of bars to generate (1-16). Default 4.
-            time_signature: Time signature (e.g. "4/4"). Default "4/4".
+            track_index: Zero-based index of the drum/percussion track.
+            clip_index: Zero-based index of the clip slot.
+            style: Drum style (see list above). Default "house".
+            bars: Number of bars (1-16). Default 4.
         """
         try:
-            # Parse time signature
-            parts = time_signature.split("/")
-            beats_per_bar = int(parts[0]) if len(parts) == 2 else 4
-            beat_unit = int(parts[1]) if len(parts) == 2 else 4
-            step_duration = 4.0 / 16  # 0.25 beats per 16th note
-            steps_per_bar = int(beats_per_bar * (16 / beat_unit))
+            bars = max(1, min(16, bars))
+            beats_per_bar = 4
+            steps_per_bar = 16
+            step_duration = 0.25
 
             patterns = _get_drum_pattern(style, steps_per_bar)
             if patterns is None:
                 return json.dumps({
                     "error": f"Unknown drum style: {style}",
-                    "available_styles": ["house", "rock", "hiphop", "trap", "dnb",
-                                         "reggaeton", "bossa_nova", "jazz_swing", "funk", "basic"],
+                    "available_styles": [
+                        "house", "rock", "hiphop", "trap", "dnb",
+                        "reggaeton", "bossa_nova", "jazz_swing", "funk", "basic",
+                    ],
                 })
 
             notes = []
@@ -557,27 +566,16 @@ def register(mcp: FastMCP, get_connection, cache):
                 bar_offset = bar * beats_per_bar
                 for pitch, hits in patterns.items():
                     for step, velocity in hits:
-                        start_time = bar_offset + step * step_duration
                         notes.append({
                             "pitch": pitch,
-                            "start_time": round(start_time, 4),
+                            "start_time": round(bar_offset + step * step_duration, 4),
                             "duration": round(step_duration, 4),
                             "velocity": velocity,
                             "mute": False,
                         })
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
 
-            # Create clip and write notes directly to Ableton
-            conn = await get_connection()
-            beats_per_bar = int(time_signature.split("/")[0]) if "/" in time_signature else 4
-            clip_length = bars * beats_per_bar
-            await conn.send_command("create_clip", {
-                "track_index": track_index, "clip_index": clip_index, "length": clip_length,
-            })
-            await conn.send_command("add_notes_to_clip", {
-                "track_index": track_index, "clip_index": clip_index, "notes": notes,
-            })
-            cache.invalidate_all()
+            await _write_to_ableton(track_index, clip_index, notes, bars * beats_per_bar)
 
             return json.dumps({
                 "status": "written to Ableton",
@@ -587,57 +585,8 @@ def register(mcp: FastMCP, get_connection, cache):
                 "bars": bars,
                 "total_notes": len(notes),
             }, indent=2)
-            # Parse time signature
-            parts = time_signature.split("/")
-            if len(parts) != 2:
-                return json.dumps({"error": f"Invalid time signature: {time_signature}"})
-            beats_per_bar = int(parts[0])
-            beat_unit = int(parts[1])
-
-            # 16th note grid: each step = 0.25 beats (for quarter-note-based meters)
-            step_duration = 4.0 / 16  # 0.25 beats per 16th note
-            steps_per_bar = int(beats_per_bar * (16 / beat_unit))
-
-            # Define patterns as lists of (step_positions, velocity) per instrument
-            # Each pattern is for one bar on a 16-step grid (when 4/4)
-            patterns = _get_drum_pattern(style, steps_per_bar)
-
-            if patterns is None:
-                return json.dumps({
-                    "error": f"Unknown style: {style}",
-                    "available_styles": [
-                        "basic", "rock", "hiphop", "trap", "house",
-                        "dnb", "reggaeton", "bossa_nova", "jazz_swing", "funk",
-                    ],
-                })
-
-            notes = []
-            for bar in range(bars):
-                bar_offset = bar * beats_per_bar
-                for pitch, hits in patterns.items():
-                    for step, velocity in hits:
-                        start_time = bar_offset + step * step_duration
-                        notes.append({
-                            "pitch": pitch,
-                            "start_time": round(start_time, 4),
-                            "duration": round(step_duration, 4),
-                            "velocity": velocity,
-                            "mute": False,
-                        })
-
-            # Sort by start time for readability
-            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-
-            return json.dumps({
-                "style": style,
-                "bars": bars,
-                "time_signature": time_signature,
-                "total_beats": beats_per_bar * bars,
-                "drum_map": GM_DRUMS,
-                "notes": notes,
-            }, indent=2)
         except Exception as e:
-            logger.error(f"Error generating rhythm pattern: {e}")
+            logger.error(f"Error generating drums: {e}")
             return json.dumps({"error": str(e)})
 
     # ------------------------------------------------------------------
@@ -647,158 +596,41 @@ def register(mcp: FastMCP, get_connection, cache):
     async def generate_bassline(
         track_index: int,
         clip_index: int,
-        key: str,
+        key: str = "C",
         bars: int = 4,
     ) -> str:
-        """Generate a bassline from trained Markov models and write it directly to a clip.
+        """Generate a bassline and write it to Ableton in one step.
 
-        ALWAYS use this tool for bass patterns. Creates the clip and writes
-        notes in one step — no need to call create_clip or add_notes_to_clip.
+        USE THIS for any request involving bass, bassline, sub bass, or low-end.
+        Trained on 391 real bass MIDI patterns from professional sample packs.
+        Creates the clip, generates the pattern, and writes it — nothing else
+        needed. Do NOT use add_notes_to_clip for bass.
 
         Args:
-            track_index: The zero-based index of the bass track.
-            clip_index: The zero-based index of the clip slot.
-            key: Root note of the key (e.g. "C", "F#", "Bb", "Am").
-            bars: Number of bars to generate (1-16). Default 4.
+            track_index: Zero-based index of the bass track.
+            clip_index: Zero-based index of the clip slot.
+            key: Root note (e.g. "C", "F#", "Bb", "Am"). Default "C".
+            bars: Number of bars (1-16). Default 4.
         """
         try:
+            bars = max(1, min(16, bars))
             notes = generate_from_markov(category="bass", key=key, bpm=120, bars=bars)
             if not notes:
-                return json.dumps({"error": "Markov model returned empty bass pattern. Check that MCP_Server/data/markov_models.json exists."})
+                return json.dumps({
+                    "error": "Failed to generate bass pattern. "
+                             "Check that MCP_Server/data/markov_models.json exists.",
+                })
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
 
-            # Create clip and write notes directly to Ableton
-            conn = await get_connection()
-            clip_length = bars * 4
-            await conn.send_command("create_clip", {
-                "track_index": track_index, "clip_index": clip_index, "length": clip_length,
-            })
-            await conn.send_command("add_notes_to_clip", {
-                "track_index": track_index, "clip_index": clip_index, "notes": notes,
-            })
-            cache.invalidate_all()
+            await _write_to_ableton(track_index, clip_index, notes, bars * 4)
 
             return json.dumps({
                 "status": "written to Ableton",
                 "track_index": track_index,
                 "clip_index": clip_index,
                 "key": key,
-                "style": "markov",
-                "source": "trained on 391 real bass MIDI patterns",
                 "bars": bars,
                 "total_notes": len(notes),
-            }, indent=2)
-
-            for bar_idx, (root_pc, quality, chord_ivs) in enumerate(bar_chords):
-                bar_offset = bar_idx * beats_per_bar
-                base_midi = (octave + 1) * 12 + root_pc
-
-                if style == "basic":
-                    # Root note on each beat
-                    for beat in range(beats_per_bar):
-                        notes.append({
-                            "pitch": base_midi,
-                            "start_time": round(bar_offset + beat, 4),
-                            "duration": 1.0,
-                            "velocity": 100 if beat == 0 else 80,
-                            "mute": False,
-                        })
-
-                elif style == "walking":
-                    # Jazz walking bass: chromatic/scalar approach to next root
-                    next_bar = bar_chords[(bar_idx + 1) % len(bar_chords)]
-                    next_root_midi = (octave + 1) * 12 + next_bar[0]
-                    # Beat 1: root, Beat 2: chord tone, Beat 3: scale tone, Beat 4: approach note
-                    chord_tone_midi = base_midi + chord_ivs[min(1, len(chord_ivs) - 1)]
-                    # Find a scale tone that isn't the root or chord tone
-                    scale_tones = [(base_midi + iv) for iv in scale_intervals if iv not in (0, chord_ivs[min(1, len(chord_ivs) - 1)] % 12)]
-                    scale_tone = scale_tones[rng.randint(0, max(0, len(scale_tones) - 1))] if scale_tones else base_midi + 5
-                    # Approach note: chromatic step toward next root
-                    if next_root_midi > base_midi:
-                        approach = next_root_midi - 1
-                    elif next_root_midi < base_midi:
-                        approach = next_root_midi + 1
-                    else:
-                        approach = base_midi + 11  # leading tone
-
-                    walk = [base_midi, chord_tone_midi, scale_tone, approach]
-                    for beat, pitch in enumerate(walk):
-                        # Keep in range
-                        while pitch > (octave + 2) * 12:
-                            pitch -= 12
-                        while pitch < octave * 12:
-                            pitch += 12
-                        pitch = max(0, min(127, pitch))
-                        notes.append({
-                            "pitch": pitch,
-                            "start_time": round(bar_offset + beat, 4),
-                            "duration": 0.9,
-                            "velocity": rng.randint(85, 105),
-                            "mute": False,
-                        })
-
-                elif style == "octave":
-                    # Root and octave alternation
-                    pattern_pitches = [base_midi, base_midi + 12, base_midi, base_midi + 12]
-                    for beat, pitch in enumerate(pattern_pitches):
-                        pitch = max(0, min(127, pitch))
-                        notes.append({
-                            "pitch": pitch,
-                            "start_time": round(bar_offset + beat, 4),
-                            "duration": 0.75,
-                            "velocity": 100 if beat % 2 == 0 else 85,
-                            "mute": False,
-                        })
-
-                elif style == "arpeggiated":
-                    # Arpeggiate through chord tones in eighth notes
-                    chord_midi = [base_midi + iv for iv in chord_ivs]
-                    for eighth in range(8):
-                        pitch = chord_midi[eighth % len(chord_midi)]
-                        # Second pass goes up an octave
-                        if eighth >= len(chord_midi):
-                            pitch += 12
-                        pitch = max(0, min(127, pitch))
-                        notes.append({
-                            "pitch": pitch,
-                            "start_time": round(bar_offset + eighth * 0.5, 4),
-                            "duration": 0.5,
-                            "velocity": 95 if eighth % 2 == 0 else 75,
-                            "mute": False,
-                        })
-
-                elif style == "syncopated":
-                    # Offbeat/syncopated pattern on 16th note grid
-                    # Typical syncopated hits: beat 1, and-of-2, beat 3, and-of-4
-                    hit_times = [0.0, 1.5, 2.0, 3.5]
-                    durations = [1.0, 0.5, 1.0, 0.5]
-                    pitches = [base_midi, base_midi, base_midi + chord_ivs[min(1, len(chord_ivs) - 1)], base_midi]
-                    for hit_t, dur, pitch in zip(hit_times, durations, pitches):
-                        pitch = max(0, min(127, pitch))
-                        notes.append({
-                            "pitch": pitch,
-                            "start_time": round(bar_offset + hit_t, 4),
-                            "duration": round(dur, 4),
-                            "velocity": rng.randint(85, 110),
-                            "mute": False,
-                        })
-
-                else:
-                    return json.dumps({
-                        "error": f"Unknown bassline style: {style}",
-                        "available_styles": ["basic", "walking", "octave", "arpeggiated", "syncopated"],
-                    })
-
-            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-
-            return json.dumps({
-                "key": NOTE_NAMES[key_pc],
-                "scale_type": scale_type,
-                "chord_progression": prog_str,
-                "style": style,
-                "bars": bars,
-                "total_beats": bars * beats_per_bar,
-                "notes": notes,
             }, indent=2)
         except Exception as e:
             logger.error(f"Error generating bassline: {e}")
@@ -811,44 +643,46 @@ def register(mcp: FastMCP, get_connection, cache):
     async def generate_melody(
         track_index: int,
         clip_index: int,
-        key: str,
+        key: str = "C",
         category: str = "synth",
         bars: int = 4,
     ) -> str:
-        """Generate a melodic pattern from trained Markov models and write it directly to a clip.
+        """Generate a melodic pattern and write it to Ableton in one step.
 
-        ALWAYS use this tool for melodies, synth lines, keys, chords, or pads.
-        Creates the clip and writes notes in one step — no need to call
-        create_clip or add_notes_to_clip.
+        USE THIS for any request involving melody, synth, keys/piano, chords,
+        pads, leads, arpeggios, or any pitched instrument that is not bass.
+        Trained on hundreds of real MIDI patterns from professional sample packs.
+        Creates the clip, generates the pattern, and writes it — nothing else
+        needed. Do NOT use add_notes_to_clip for melodies.
+
+        Categories: synth (251 patterns), keys (155 patterns), chords (96 patterns),
+        pads (50 patterns), melody (27 patterns).
 
         Args:
-            track_index: The zero-based index of the target track.
-            clip_index: The zero-based index of the clip slot.
-            key: Root note of the key (e.g. "C", "F#", "Bb", "Am").
-            category: Type of pattern. Options: synth, keys, chords, pads, melody.
-                Default "synth".
-            bars: Number of bars to generate (1-16). Default 4.
+            track_index: Zero-based index of the target track.
+            clip_index: Zero-based index of the clip slot.
+            key: Root note (e.g. "C", "F#", "Bb", "Am"). Default "C".
+            category: Pattern type: synth, keys, chords, pads, melody. Default "synth".
+            bars: Number of bars (1-16). Default 4.
         """
         try:
             valid_categories = {"synth", "keys", "chords", "pads", "melody"}
             if category not in valid_categories:
-                return json.dumps({"error": f"Unknown category: {category}. Options: {', '.join(sorted(valid_categories))}"})
+                return json.dumps({
+                    "error": f"Unknown category: {category}",
+                    "available_categories": sorted(valid_categories),
+                })
 
+            bars = max(1, min(16, bars))
             notes = generate_from_markov(category=category, key=key, bpm=120, bars=bars)
             if not notes:
-                return json.dumps({"error": f"Markov model returned empty {category} pattern. Check that MCP_Server/data/markov_models.json exists."})
+                return json.dumps({
+                    "error": f"Failed to generate {category} pattern. "
+                             "Check that MCP_Server/data/markov_models.json exists.",
+                })
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
 
-            # Create clip and write notes directly to Ableton
-            conn = await get_connection()
-            clip_length = bars * 4
-            await conn.send_command("create_clip", {
-                "track_index": track_index, "clip_index": clip_index, "length": clip_length,
-            })
-            await conn.send_command("add_notes_to_clip", {
-                "track_index": track_index, "clip_index": clip_index, "notes": notes,
-            })
-            cache.invalidate_all()
+            await _write_to_ableton(track_index, clip_index, notes, bars * 4)
 
             return json.dumps({
                 "status": "written to Ableton",
@@ -856,110 +690,8 @@ def register(mcp: FastMCP, get_connection, cache):
                 "clip_index": clip_index,
                 "key": key,
                 "category": category,
-                "style": "markov",
-                "source": f"trained on real {category} MIDI patterns",
                 "bars": bars,
                 "total_notes": len(notes),
-            }, indent=2)
-
-            if scale_type not in SCALE_INTERVALS:
-                return json.dumps({
-                    "error": f"Unknown scale type: {scale_type}",
-                    "available_types": sorted(SCALE_INTERVALS.keys()),
-                })
-
-            key_pc = _note_name_to_pitch_class(key)
-            # Build 2-octave scale for melodic range
-            scale_notes = _get_scale_pitches(key_pc, scale_type, octave, 2)
-            if not scale_notes:
-                return json.dumps({"error": "Could not generate scale notes"})
-
-            rng = random.Random(42)
-            beats_per_bar = 4
-            total_beats = bars * beats_per_bar
-
-            # Duration pools by density
-            if density == "sparse":
-                duration_pool = [2.0, 2.0, 1.0, 1.0, 4.0]
-            elif density == "dense":
-                duration_pool = [0.25, 0.25, 0.5, 0.5, 0.5, 1.0]
-            else:  # medium
-                duration_pool = [0.5, 0.5, 1.0, 1.0, 0.25, 2.0]
-
-            notes = []
-            current_time = 0.0
-            # Start near the middle of the scale
-            current_idx = len(scale_notes) // 2
-
-            while current_time < total_beats:
-                duration = rng.choice(duration_pool)
-                # Don't exceed total length
-                if current_time + duration > total_beats:
-                    duration = total_beats - current_time
-                if duration <= 0:
-                    break
-
-                # Choose next note based on style
-                if style == "stepwise":
-                    # Mostly steps, rare leaps
-                    step = rng.choice([-1, -1, 1, 1, -2, 2, 0])
-                elif style == "arpeggiated":
-                    # Larger intervals (arpeggiate through scale)
-                    step = rng.choice([-2, -1, 1, 2, 2, 3, -3])
-                else:  # simple
-                    # Balanced mix
-                    step = rng.choice([-2, -1, -1, 0, 1, 1, 2, 3, -3])
-
-                current_idx = max(0, min(len(scale_notes) - 1, current_idx + step))
-
-                # Tendency toward tonic on bar boundaries (resolution)
-                is_bar_boundary = (current_time % beats_per_bar) == 0
-                is_last_beat = (current_time + duration) >= total_beats
-                if (is_bar_boundary or is_last_beat) and rng.random() < 0.4:
-                    # Find nearest tonic
-                    tonic_midi = (octave + 1) * 12 + key_pc
-                    tonic_indices = [i for i, n in enumerate(scale_notes) if n % 12 == key_pc]
-                    if tonic_indices:
-                        closest = min(tonic_indices, key=lambda i: abs(i - current_idx))
-                        current_idx = closest
-
-                # Force resolve to tonic on final note
-                if is_last_beat:
-                    tonic_indices = [i for i, n in enumerate(scale_notes) if n % 12 == key_pc]
-                    if tonic_indices:
-                        current_idx = min(tonic_indices, key=lambda i: abs(i - current_idx))
-
-                pitch = scale_notes[current_idx]
-
-                # Add occasional rests (skip note) for musicality
-                if rng.random() < 0.1 and not is_last_beat:
-                    current_time += duration
-                    continue
-
-                velocity = rng.randint(70, 110)
-                # Accent downbeats
-                if (current_time % beats_per_bar) == 0:
-                    velocity = min(127, velocity + 15)
-
-                notes.append({
-                    "pitch": pitch,
-                    "start_time": round(current_time, 4),
-                    "duration": round(duration * 0.9, 4),  # Slight gap for articulation
-                    "velocity": velocity,
-                    "mute": False,
-                })
-                current_time += duration
-
-            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
-
-            return json.dumps({
-                "key": NOTE_NAMES[key_pc],
-                "scale_type": scale_type,
-                "style": style,
-                "density": density,
-                "bars": bars,
-                "total_beats": total_beats,
-                "notes": notes,
             }, indent=2)
         except Exception as e:
             logger.error(f"Error generating melody: {e}")
