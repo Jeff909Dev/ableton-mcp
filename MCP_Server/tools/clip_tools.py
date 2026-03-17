@@ -7,6 +7,10 @@ from mcp.server.fastmcp import FastMCP
 logger = logging.getLogger("AbletonMCPServer")
 
 
+
+
+
+
 def register(mcp: FastMCP, get_connection, cache):
     """Register clip tools with the MCP server"""
 
@@ -38,15 +42,16 @@ def register(mcp: FastMCP, get_connection, cache):
         clip_index: int,
         notes: List[Dict[str, Union[int, float, bool]]],
     ) -> str:
-        """Add MIDI notes to a clip.
+        """Add MIDI notes to an existing clip. Low-level tool.
 
-        IMPORTANT: Do NOT manually write MIDI notes. Always use the generation
-        tools first to get high-quality notes from trained Markov models:
-        - generate_rhythm_pattern → for drums/percussion
-        - generate_bassline → for bass patterns
-        - generate_melody → for melodies, synths, keys, pads
-        - generate_chord_progression → for chord voicings
-        Then pass the resulting notes to this tool.
+        WARNING: You almost certainly should NOT call this directly. Use these
+        tools instead — they generate AND write notes in one step:
+        - generate_rhythm_pattern(track_index, clip_index, bars) → drums
+        - generate_bassline(track_index, clip_index, key, bars) → bass
+        - generate_melody(track_index, clip_index, key, category, bars) → synth/keys/pads/melody
+        Those tools create the clip, generate Markov-trained patterns, and write
+        them to Ableton automatically. Only use add_notes_to_clip for appending
+        extra notes to an existing clip.
 
         Each note is a dictionary with the following keys:
             pitch: MIDI note number (0-127).

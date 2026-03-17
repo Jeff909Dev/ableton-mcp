@@ -516,43 +516,48 @@ def register(mcp: FastMCP, get_connection, cache):
     # ------------------------------------------------------------------
     @mcp.tool()
     async def generate_rhythm_pattern(
-        style: str = "markov",
-        bars: int = 1,
+        track_index: int,
+        clip_index: int,
+        bars: int = 4,
         time_signature: str = "4/4",
     ) -> str:
-        """Generate a drum/rhythm pattern using Markov chains trained on real MIDI patterns.
+        """Generate a drum pattern from trained Markov models and write it directly to a clip.
 
-        ALWAYS use this tool when creating drum or percussion patterns. Do not
-        manually write drum notes — this tool produces realistic grooves learned
-        from 72 professional drum patterns.
-
-        Uses standard General MIDI drum mapping:
-        kick=36, snare=38, closed_hh=42, open_hh=46, clap=39, rim=37,
-        tom_low=43, tom_mid=47, tom_hi=50, crash=49, ride=51.
+        ALWAYS use this tool for drums/percussion. Creates the clip and writes
+        notes in one step — no need to call create_clip or add_notes_to_clip.
 
         Args:
-            style: Pattern style. Options: markov (learned from real MIDI patterns — recommended),
-                basic, rock, hiphop, trap, house, dnb, reggaeton, bossa_nova, jazz_swing, funk.
-            bars: Number of bars to generate (1-8). Default 1.
-            time_signature: Time signature as "numerator/denominator" (e.g. "4/4").
-                Default "4/4".
+            track_index: The zero-based index of the drum track.
+            clip_index: The zero-based index of the clip slot.
+            bars: Number of bars to generate (1-16). Default 4.
+            time_signature: Time signature (e.g. "4/4"). Default "4/4".
         """
         try:
-            # Always use Markov-based generation from trained MIDI patterns
-            notes = generate_from_markov(
-                category="drums", bpm=120, bars=bars
-            )
+            notes = generate_from_markov(category="drums", bpm=120, bars=bars)
             if not notes:
                 return json.dumps({"error": "Markov model returned empty drum pattern. Check that MCP_Server/data/markov_models.json exists."})
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+
+            # Create clip and write notes directly to Ableton
+            conn = await get_connection()
+            beats_per_bar = int(time_signature.split("/")[0]) if "/" in time_signature else 4
+            clip_length = bars * beats_per_bar
+            await conn.send_command("create_clip", {
+                "track_index": track_index, "clip_index": clip_index, "length": clip_length,
+            })
+            await conn.send_command("add_notes_to_clip", {
+                "track_index": track_index, "clip_index": clip_index, "notes": notes,
+            })
+            cache.invalidate_all()
+
             return json.dumps({
+                "status": "written to Ableton",
+                "track_index": track_index,
+                "clip_index": clip_index,
                 "style": "markov",
                 "source": "trained on 72 real drum MIDI patterns",
                 "bars": bars,
-                "time_signature": time_signature,
-                "total_beats": bars * 4,
-                "drum_map": GM_DRUMS,
-                "notes": notes,
+                "total_notes": len(notes),
             }, indent=2)
             # Parse time signature
             parts = time_signature.split("/")
@@ -612,79 +617,48 @@ def register(mcp: FastMCP, get_connection, cache):
     # ------------------------------------------------------------------
     @mcp.tool()
     async def generate_bassline(
+        track_index: int,
+        clip_index: int,
         key: str,
-        scale_type: str = "minor_pentatonic",
-        chord_progression: str = "i-iv-VII-v",
         bars: int = 4,
-        style: str = "markov",
-        octave: int = 2,
     ) -> str:
-        """Generate a bassline using Markov chains trained on 391 real bass MIDI patterns.
+        """Generate a bassline from trained Markov models and write it directly to a clip.
 
-        ALWAYS use this tool when creating bass patterns. Do not manually write
-        bass notes — this tool produces realistic basslines learned from
-        professional sample packs. Output is ready for add_notes_to_clip.
+        ALWAYS use this tool for bass patterns. Creates the clip and writes
+        notes in one step — no need to call create_clip or add_notes_to_clip.
 
         Args:
-            key: Root note of the key (e.g. "C", "F#", "Bb").
-            scale_type: Scale for note selection. Default "minor_pentatonic".
-            chord_progression: Dash-separated Roman numerals or a preset name.
-                Default "i-iv-VII-v".
-            bars: Number of bars to generate. Default 4.
-            style: Bassline style. Options: markov (learned from real MIDI patterns — recommended),
-                basic (root notes on each beat), walking (jazz walking bass),
-                octave (root + octave pattern), arpeggiated (chord arpeggios),
-                syncopated (offbeat rhythms). Default "markov".
-            octave: MIDI octave for the bass (0-3). Default 2.
+            track_index: The zero-based index of the bass track.
+            clip_index: The zero-based index of the clip slot.
+            key: Root note of the key (e.g. "C", "F#", "Bb", "Am").
+            bars: Number of bars to generate (1-16). Default 4.
         """
         try:
-            key_pc = _note_name_to_pitch_class(key)
-
-            # Determine mode from progression or scale
-            mode = "minor" if scale_type in (
-                "minor", "harmonic_minor", "melodic_minor", "dorian",
-                "phrygian", "minor_pentatonic",
-            ) else "major"
-
-            # Resolve progression
-            prog_str = COMMON_PROGRESSIONS.get(chord_progression, chord_progression)
-            numerals = [n.strip() for n in prog_str.split("-") if n.strip()]
-
-            if not numerals:
-                return json.dumps({"error": "Empty chord progression"})
-
-            # Build scale pitch classes for walking/arpeggiated styles
-            scale_intervals = SCALE_INTERVALS.get(scale_type, SCALE_INTERVALS["minor_pentatonic"])
-            scale_pcs = set((key_pc + iv) % 12 for iv in scale_intervals)
-
-            # Assign chords to bars (cycle if progression is shorter than bars)
-            bar_chords = []
-            for bar_idx in range(bars):
-                numeral = numerals[bar_idx % len(numerals)]
-                root_pc, quality = _parse_roman_numeral(numeral, key_pc, mode)
-                chord_intervals = CHORD_INTERVALS.get(quality, [0, 4, 7])
-                bar_chords.append((root_pc, quality, chord_intervals))
-
-            rng = random.Random(42)  # Deterministic seed for reproducibility
-            notes = []
-            beats_per_bar = 4
-
-            # Always use Markov-based generation from trained MIDI patterns
-            notes = generate_from_markov(
-                category="bass", key=key, bpm=120, bars=bars
-            )
+            notes = generate_from_markov(category="bass", key=key, bpm=120, bars=bars)
             if not notes:
                 return json.dumps({"error": "Markov model returned empty bass pattern. Check that MCP_Server/data/markov_models.json exists."})
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+
+            # Create clip and write notes directly to Ableton
+            conn = await get_connection()
+            clip_length = bars * 4
+            await conn.send_command("create_clip", {
+                "track_index": track_index, "clip_index": clip_index, "length": clip_length,
+            })
+            await conn.send_command("add_notes_to_clip", {
+                "track_index": track_index, "clip_index": clip_index, "notes": notes,
+            })
+            cache.invalidate_all()
+
             return json.dumps({
-                "key": NOTE_NAMES[key_pc],
-                "scale_type": scale_type,
-                "chord_progression": prog_str,
+                "status": "written to Ableton",
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "key": key,
                 "style": "markov",
                 "source": "trained on 391 real bass MIDI patterns",
                 "bars": bars,
-                "total_beats": bars * beats_per_bar,
-                "notes": notes,
+                "total_notes": len(notes),
             }, indent=2)
 
             for bar_idx, (root_pc, quality, chord_ivs) in enumerate(bar_chords):
@@ -807,47 +781,57 @@ def register(mcp: FastMCP, get_connection, cache):
     # ------------------------------------------------------------------
     @mcp.tool()
     async def generate_melody(
+        track_index: int,
+        clip_index: int,
         key: str,
-        scale_type: str = "major",
+        category: str = "synth",
         bars: int = 4,
-        octave: int = 5,
-        density: str = "medium",
-        style: str = "markov",
     ) -> str:
-        """Generate a melody using Markov chains trained on real MIDI patterns.
+        """Generate a melodic pattern from trained Markov models and write it directly to a clip.
 
-        ALWAYS use this tool when creating melodies, synth lines, keys, or pad
-        patterns. Do not manually write melodic notes — this tool produces
-        realistic patterns learned from professional sample packs.
-        Output is ready for add_notes_to_clip.
+        ALWAYS use this tool for melodies, synth lines, keys, chords, or pads.
+        Creates the clip and writes notes in one step — no need to call
+        create_clip or add_notes_to_clip.
 
         Args:
-            key: Root note of the key (e.g. "C", "F#", "Bb").
-            scale_type: Scale to use. Default "major".
-            bars: Number of bars. Default 4.
-            octave: MIDI octave for the melody. Default 5.
-            density: Note density. Options: sparse (few long notes), medium
-                (quarter/eighth mix), dense (mostly eighth/sixteenth notes).
-            style: Melodic style. Options: markov (learned from real MIDI patterns — recommended),
-                simple (mixed rhythms), arpeggiated (chord-tone focused),
-                stepwise (mostly scale steps).
+            track_index: The zero-based index of the target track.
+            clip_index: The zero-based index of the clip slot.
+            key: Root note of the key (e.g. "C", "F#", "Bb", "Am").
+            category: Type of pattern. Options: synth, keys, chords, pads, melody.
+                Default "synth".
+            bars: Number of bars to generate (1-16). Default 4.
         """
         try:
-            # Always use Markov-based generation from trained MIDI patterns
-            notes = generate_from_markov(
-                category="melody", key=key, bpm=120, bars=bars
-            )
+            valid_categories = {"synth", "keys", "chords", "pads", "melody"}
+            if category not in valid_categories:
+                return json.dumps({"error": f"Unknown category: {category}. Options: {', '.join(sorted(valid_categories))}"})
+
+            notes = generate_from_markov(category=category, key=key, bpm=120, bars=bars)
             if not notes:
-                return json.dumps({"error": "Markov model returned empty melody. Check that MCP_Server/data/markov_models.json exists."})
+                return json.dumps({"error": f"Markov model returned empty {category} pattern. Check that MCP_Server/data/markov_models.json exists."})
             notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+
+            # Create clip and write notes directly to Ableton
+            conn = await get_connection()
+            clip_length = bars * 4
+            await conn.send_command("create_clip", {
+                "track_index": track_index, "clip_index": clip_index, "length": clip_length,
+            })
+            await conn.send_command("add_notes_to_clip", {
+                "track_index": track_index, "clip_index": clip_index, "notes": notes,
+            })
+            cache.invalidate_all()
+
             return json.dumps({
+                "status": "written to Ableton",
+                "track_index": track_index,
+                "clip_index": clip_index,
                 "key": key,
-                "scale_type": scale_type,
+                "category": category,
                 "style": "markov",
-                "source": "trained on real MIDI melody patterns",
+                "source": f"trained on real {category} MIDI patterns",
                 "bars": bars,
-                "total_beats": bars * 4,
-                "notes": notes,
+                "total_notes": len(notes),
             }, indent=2)
 
             if scale_type not in SCALE_INTERVALS:
