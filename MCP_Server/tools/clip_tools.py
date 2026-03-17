@@ -40,6 +40,14 @@ def register(mcp: FastMCP, get_connection, cache):
     ) -> str:
         """Add MIDI notes to a clip.
 
+        IMPORTANT: Do NOT manually write MIDI notes. Always use the generation
+        tools first to get high-quality notes from trained Markov models:
+        - generate_rhythm_pattern → for drums/percussion
+        - generate_bassline → for bass patterns
+        - generate_melody → for melodies, synths, keys, pads
+        - generate_chord_progression → for chord voicings
+        Then pass the resulting notes to this tool.
+
         Each note is a dictionary with the following keys:
             pitch: MIDI note number (0-127).
             start_time: Note start position in beats.

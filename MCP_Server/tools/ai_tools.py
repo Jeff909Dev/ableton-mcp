@@ -520,7 +520,11 @@ def register(mcp: FastMCP, get_connection, cache):
         bars: int = 1,
         time_signature: str = "4/4",
     ) -> str:
-        """Generate a drum/rhythm pattern as MIDI notes ready for add_notes_to_clip.
+        """Generate a drum/rhythm pattern using Markov chains trained on real MIDI patterns.
+
+        ALWAYS use this tool when creating drum or percussion patterns. Do not
+        manually write drum notes — this tool produces realistic grooves learned
+        from 72 professional drum patterns.
 
         Uses standard General MIDI drum mapping:
         kick=36, snare=38, closed_hh=42, open_hh=46, clap=39, rim=37,
@@ -615,9 +619,11 @@ def register(mcp: FastMCP, get_connection, cache):
         style: str = "markov",
         octave: int = 2,
     ) -> str:
-        """Generate a bassline that follows a chord progression.
+        """Generate a bassline using Markov chains trained on 391 real bass MIDI patterns.
 
-        Produces MIDI notes ready for add_notes_to_clip.
+        ALWAYS use this tool when creating bass patterns. Do not manually write
+        bass notes — this tool produces realistic basslines learned from
+        professional sample packs. Output is ready for add_notes_to_clip.
 
         Args:
             key: Root note of the key (e.g. "C", "F#", "Bb").
@@ -808,9 +814,12 @@ def register(mcp: FastMCP, get_connection, cache):
         density: str = "medium",
         style: str = "markov",
     ) -> str:
-        """Generate a melody within a scale.
+        """Generate a melody using Markov chains trained on real MIDI patterns.
 
-        Produces MIDI notes ready for add_notes_to_clip.
+        ALWAYS use this tool when creating melodies, synth lines, keys, or pad
+        patterns. Do not manually write melodic notes — this tool produces
+        realistic patterns learned from professional sample packs.
+        Output is ready for add_notes_to_clip.
 
         Args:
             key: Root note of the key (e.g. "C", "F#", "Bb").
