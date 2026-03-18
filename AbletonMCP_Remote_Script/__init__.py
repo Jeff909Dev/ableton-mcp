@@ -75,9 +75,6 @@ class AbletonMCP(ControlSurface):
             "get_device_parameters": self._get_device_parameters_handler,
             "get_device_info": self._get_device_info_handler,
             # Browser (read-only)
-            "get_browser_item": self._get_browser_item_handler,
-            "get_browser_categories": self._get_browser_categories_handler,
-            "get_browser_items": self._get_browser_items_handler,
             "get_browser_tree": self._get_browser_tree_handler,
             "get_browser_items_at_path": self._get_browser_items_at_path_handler,
             "search_browser": self._search_browser_handler,
@@ -129,9 +126,16 @@ class AbletonMCP(ControlSurface):
             "tap_tempo": self._tap_tempo_handler,
             "set_arrangement_position": self._set_arrangement_position_handler,
             "set_record": self._set_record_handler,
+            # Audio clip operations (write)
+            "create_audio_clip": self._create_audio_clip_handler,
+            "set_clip_pitch": self._set_clip_pitch_handler,
+            "set_clip_warp": self._set_clip_warp_handler,
+            # Audio clip info (read)
+            "get_audio_clip_info": self._get_audio_clip_info_handler,
             # Browser load (write)
             "load_browser_item": self._load_browser_item_handler,
-            "load_instrument_or_effect": self._load_instrument_or_effect_handler,
+            "load_sample_to_drum_pad": self._load_sample_to_drum_pad_handler,
+            "build_drum_rack": self._build_drum_rack_handler,
         }
 
         # Read-only commands execute directly on the socket thread
@@ -146,12 +150,10 @@ class AbletonMCP(ControlSurface):
             "get_all_scenes",
             "get_device_parameters",
             "get_device_info",
-            "get_browser_item",
-            "get_browser_categories",
-            "get_browser_items",
             "get_browser_tree",
             "get_browser_items_at_path",
             "search_browser",
+            "get_audio_clip_info",
         }
 
         # Write commands must be scheduled on Ableton's main thread
@@ -200,7 +202,11 @@ class AbletonMCP(ControlSurface):
             "set_arrangement_position",
             "set_record",
             "load_browser_item",
-            "load_instrument_or_effect",
+            "load_sample_to_drum_pad",
+            "create_audio_clip",
+            "set_clip_pitch",
+            "set_clip_warp",
+            "build_drum_rack",
         }
 
     # ------------------------------------------------------------------
@@ -463,20 +469,6 @@ class AbletonMCP(ControlSurface):
 
     # -- Browser read-only ---------------------------------------------
 
-    def _get_browser_item_handler(self, params):
-        uri = params.get("uri", None)
-        path = params.get("path", None)
-        return self._get_browser_item(uri, path)
-
-    def _get_browser_categories_handler(self, params):
-        category_type = params.get("category_type", "all")
-        return self._get_browser_categories(category_type)
-
-    def _get_browser_items_handler(self, params):
-        path = params.get("path", "")
-        item_type = params.get("item_type", "all")
-        return self._get_browser_items(path, item_type)
-
     def _get_browser_tree_handler(self, params):
         category_type = params.get("category_type", "all")
         return self.get_browser_tree(category_type)
@@ -610,6 +602,31 @@ class AbletonMCP(ControlSurface):
         clip_index = params.get("clip_index", 0)
         return self._stop_clip(track_index, clip_index)
 
+    def _create_audio_clip_handler(self, params):
+        track_index = params.get("track_index", 0)
+        clip_index = params.get("clip_index", 0)
+        file_path = params.get("file_path", "")
+        return self._create_audio_clip(track_index, clip_index, file_path)
+
+    def _set_clip_pitch_handler(self, params):
+        track_index = params.get("track_index", 0)
+        clip_index = params.get("clip_index", 0)
+        pitch_coarse = params.get("pitch_coarse", None)
+        pitch_fine = params.get("pitch_fine", None)
+        return self._set_clip_pitch(track_index, clip_index, pitch_coarse, pitch_fine)
+
+    def _set_clip_warp_handler(self, params):
+        track_index = params.get("track_index", 0)
+        clip_index = params.get("clip_index", 0)
+        warping = params.get("warping", None)
+        warp_mode = params.get("warp_mode", None)
+        return self._set_clip_warp(track_index, clip_index, warping, warp_mode)
+
+    def _get_audio_clip_info_handler(self, params):
+        track_index = params.get("track_index", 0)
+        clip_index = params.get("clip_index", 0)
+        return self._get_audio_clip_info(track_index, clip_index)
+
     # -- Scene management (write) --------------------------------------
 
     def _create_scene_handler(self, params):
@@ -716,10 +733,16 @@ class AbletonMCP(ControlSurface):
         item_uri = params.get("item_uri", "")
         return self._load_browser_item(track_index, item_uri)
 
-    def _load_instrument_or_effect_handler(self, params):
+    def _build_drum_rack_handler(self, params):
         track_index = params.get("track_index", 0)
-        uri = params.get("uri", "")
-        return self._load_instrument_or_effect(track_index, uri)
+        pad_samples = params.get("pad_samples", [])
+        return self._build_drum_rack(track_index, pad_samples)
+
+    def _load_sample_to_drum_pad_handler(self, params):
+        track_index = params.get("track_index", 0)
+        pad_note = params.get("pad_note", 36)
+        item_uri = params.get("item_uri", "")
+        return self._load_sample_to_drum_pad(track_index, pad_note, item_uri)
 
     # ==================================================================
     # Command implementations
@@ -1327,6 +1350,140 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting clip loop: " + str(e))
             raise
 
+    def _create_audio_clip(self, track_index, clip_index, file_path):
+        """Create an audio clip from a file path in a specific clip slot.
+
+        Uses ClipSlot.create_audio_clip(file_path) available in Live 12+.
+        This allows loading audio into ANY clip slot, not just slot 0.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if not track.has_audio_input:
+                raise ValueError("Track {0} is not an audio track".format(track_index))
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if clip_slot.has_clip:
+                raise ValueError("Clip slot {0} already has a clip".format(clip_index))
+
+            # Use Live 12's create_audio_clip API
+            clip_slot.create_audio_clip(file_path)
+
+            clip = clip_slot.clip
+            result = {
+                "created": True,
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "name": clip.name if hasattr(clip, 'name') else "",
+                "length": clip.length if hasattr(clip, 'length') else 0,
+            }
+            if hasattr(clip, 'is_audio_clip') and clip.is_audio_clip:
+                result["is_audio_clip"] = True
+                if hasattr(clip, 'file_path'):
+                    result["file_path"] = clip.file_path
+            return result
+        except AttributeError:
+            raise ValueError(
+                "create_audio_clip not available. Requires Ableton Live 12.0.5+. "
+                "Use load_browser_item as fallback."
+            )
+        except Exception as e:
+            self.log_message("Error creating audio clip: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _set_clip_pitch(self, track_index, clip_index, pitch_coarse, pitch_fine):
+        """Set pitch transpose on an audio clip."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+            clip = clip_slot.clip
+            if not clip.is_audio_clip:
+                raise Exception("Clip is not an audio clip — pitch only works on audio")
+            if pitch_coarse is not None:
+                clip.pitch_coarse = max(-48, min(48, int(pitch_coarse)))
+            if pitch_fine is not None:
+                clip.pitch_fine = max(-500, min(500, int(pitch_fine)))
+            return {
+                "pitch_coarse": clip.pitch_coarse,
+                "pitch_fine": clip.pitch_fine,
+            }
+        except Exception as e:
+            self.log_message("Error setting clip pitch: {0}".format(str(e)))
+            raise
+
+    def _set_clip_warp(self, track_index, clip_index, warping, warp_mode):
+        """Set warp properties on an audio clip.
+
+        warp_mode values: 0=beats, 1=complex, 2=complex_pro,
+        3=repitch, 4=rex, 5=texture, 6=tones
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+            clip = clip_slot.clip
+            if not clip.is_audio_clip:
+                raise Exception("Clip is not an audio clip — warping only works on audio")
+            if warping is not None:
+                clip.warping = bool(warping)
+            if warp_mode is not None:
+                clip.warp_mode = max(0, min(6, int(warp_mode)))
+            return {
+                "warping": clip.warping,
+                "warp_mode": clip.warp_mode,
+            }
+        except Exception as e:
+            self.log_message("Error setting clip warp: {0}".format(str(e)))
+            raise
+
+    def _get_audio_clip_info(self, track_index, clip_index):
+        """Get audio-specific clip properties."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            clip_slot = track.clip_slots[clip_index]
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+            clip = clip_slot.clip
+            info = {
+                "name": clip.name,
+                "is_audio_clip": clip.is_audio_clip,
+                "is_midi_clip": hasattr(clip, 'is_midi_clip') and clip.is_midi_clip,
+                "length": clip.length,
+                "looping": clip.looping,
+            }
+            if clip.is_audio_clip:
+                info["pitch_coarse"] = clip.pitch_coarse
+                info["pitch_fine"] = clip.pitch_fine
+                info["warping"] = clip.warping
+                info["warp_mode"] = clip.warp_mode
+                info["gain"] = clip.gain
+                if hasattr(clip, 'file_path'):
+                    info["file_path"] = clip.file_path
+                if hasattr(clip, 'sample_length'):
+                    info["sample_length"] = clip.sample_length
+            return info
+        except Exception as e:
+            self.log_message("Error getting audio clip info: {0}".format(str(e)))
+            raise
+
     def _quantize_clip(self, track_index, clip_index, quantization, amount):
         """Quantize notes in a clip"""
         try:
@@ -1776,135 +1933,101 @@ class AbletonMCP(ControlSurface):
 
     # -- Browser -------------------------------------------------------
 
-    def _get_browser_item(self, uri, path):
-        """Get a browser item by URI or path"""
+    def _build_drum_rack(self, track_index, pad_samples):
+        """Build a complete drum rack in one call: load Drum Rack + samples to pads.
+
+        pad_samples is a list of {"pad_note": 36, "path_or_uri": "user_folders/..."}.
+        This avoids multiple round-trips by doing everything server-side.
+        """
         try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index {0} out of range".format(track_index))
+            track = self._song.tracks[track_index]
             app = self.application()
-            if not app:
-                raise RuntimeError("Could not access Live application")
 
-            result = {
-                "uri": uri,
-                "path": path,
-                "found": False
-            }
-
-            if uri:
-                item = self._find_browser_item_by_uri(app.browser, uri)
-                if item:
-                    result["found"] = True
-                    result["item"] = {
-                        "name": item.name,
-                        "is_folder": item.is_folder,
-                        "is_device": item.is_device,
-                        "is_loadable": item.is_loadable,
-                        "uri": item.uri
-                    }
-                    return result
-
-            if path:
-                path_parts = path.split("/")
-
-                current_item = None
-                if path_parts[0].lower() == "instruments":
-                    current_item = app.browser.instruments
-                elif path_parts[0].lower() == "sounds":
-                    current_item = app.browser.sounds
-                elif path_parts[0].lower() == "drums":
-                    current_item = app.browser.drums
-                elif path_parts[0].lower() == "audio_effects":
-                    current_item = app.browser.audio_effects
-                elif path_parts[0].lower() == "midi_effects":
-                    current_item = app.browser.midi_effects
-                else:
-                    current_item = app.browser.instruments
-                    path_parts = ["instruments"] + path_parts
-
-                for i in range(1, len(path_parts)):
-                    part = path_parts[i]
-                    if not part:
-                        continue
-                    found = False
-                    for child in current_item.children:
-                        if child.name.lower() == part.lower():
-                            current_item = child
-                            found = True
+            # Step 1: Find and load a Drum Rack onto the track
+            drums_root = app.browser.drums
+            drum_rack_item = None
+            if hasattr(drums_root, 'children'):
+                for child in drums_root.children:
+                    if hasattr(child, 'name') and child.name == "Drum Rack":
+                        if hasattr(child, 'is_loadable') and child.is_loadable:
+                            drum_rack_item = child
                             break
-                    if not found:
-                        result["error"] = "Path part '{0}' not found".format(part)
-                        return result
+            if drum_rack_item is None:
+                raise ValueError("Could not find empty Drum Rack in browser")
 
-                result["found"] = True
-                result["item"] = {
-                    "name": current_item.name,
-                    "is_folder": current_item.is_folder,
-                    "is_device": current_item.is_device,
-                    "is_loadable": current_item.is_loadable,
-                    "uri": current_item.uri
-                }
+            self._song.view.selected_track = track
+            app.browser.load_item(drum_rack_item)
+            self.log_message("Loaded Drum Rack onto track {0}".format(track_index))
 
-            return result
+            # Step 2: Find the drum rack device on the track
+            drum_rack = None
+            for device in track.devices:
+                if device.can_have_drum_pads:
+                    drum_rack = device
+                    break
+            if drum_rack is None:
+                raise ValueError("Drum Rack device not found on track after loading")
+
+            # Step 3: Load samples into pads
+            loaded_pads = []
+            failed_pads = []
+            for pad_info in pad_samples:
+                pad_note = pad_info.get("pad_note", 36)
+                path_or_uri = pad_info.get("path_or_uri", "")
+                try:
+                    # Find the pad
+                    target_pad = None
+                    for pad in drum_rack.drum_pads:
+                        if pad.note == pad_note:
+                            target_pad = pad
+                            break
+                    if target_pad is None:
+                        failed_pads.append({"pad_note": pad_note, "error": "Pad not found"})
+                        continue
+
+                    # Find the browser item
+                    item = self._resolve_browser_item(path_or_uri)
+                    if not item:
+                        failed_pads.append({"pad_note": pad_note, "error": "Sample not found: {0}".format(path_or_uri)})
+                        continue
+
+                    # Select pad and load
+                    drum_rack.view.selected_drum_pad = target_pad
+                    app.browser.load_item(item)
+                    loaded_pads.append({
+                        "pad_note": pad_note,
+                        "sample": item.name if hasattr(item, 'name') else path_or_uri,
+                    })
+                except Exception as e:
+                    failed_pads.append({"pad_note": pad_note, "error": str(e)})
+
+            return {
+                "status": "ok",
+                "track_index": track_index,
+                "drum_rack": "loaded",
+                "loaded_pads": loaded_pads,
+                "failed_pads": failed_pads,
+            }
         except Exception as e:
-            self.log_message("Error getting browser item: " + str(e))
+            self.log_message("Error building drum rack: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
             raise
 
-    def _get_browser_categories(self, category_type):
-        """Get browser categories"""
-        try:
-            app = self.application()
-            if not app:
-                raise RuntimeError("Could not access Live application")
-            browser = app.browser
-
-            categories = []
-            category_map = {
-                "instruments": ("Instruments", "instruments"),
-                "sounds": ("Sounds", "sounds"),
-                "drums": ("Drums", "drums"),
-                "audio_effects": ("Audio Effects", "audio_effects"),
-                "midi_effects": ("MIDI Effects", "midi_effects"),
-            }
-
-            for key, (display_name, attr_name) in category_map.items():
-                if category_type == "all" or category_type == key:
-                    if hasattr(browser, attr_name):
-                        try:
-                            item = getattr(browser, attr_name)
-                            categories.append({
-                                "name": display_name,
-                                "key": key,
-                                "has_children": hasattr(item, 'children') and bool(item.children)
-                            })
-                        except Exception:
-                            pass
-
-            return {"categories": categories}
-        except Exception as e:
-            self.log_message("Error getting browser categories: " + str(e))
-            raise
-
-    def _get_browser_items(self, path, item_type):
-        """Get browser items at a given path"""
-        try:
-            return self.get_browser_items_at_path(path)
-        except Exception as e:
-            self.log_message("Error getting browser items: " + str(e))
-            raise
-
     def _load_browser_item(self, track_index, item_uri):
-        """Load a browser item onto a track by its URI"""
+        """Load a browser item onto a track by its URI or path"""
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
             track = self._song.tracks[track_index]
 
-            app = self.application()
-            item = self._find_browser_item_by_uri(app.browser, item_uri)
+            item = self._resolve_browser_item(item_uri)
             if not item:
                 raise ValueError("Browser item with URI '{0}' not found".format(item_uri))
 
             self._song.view.selected_track = track
+            app = self.application()
             app.browser.load_item(item)
 
             return {
@@ -1918,13 +2041,147 @@ class AbletonMCP(ControlSurface):
             self.log_message(traceback.format_exc())
             raise
 
-    def _load_instrument_or_effect(self, track_index, uri):
-        """Load an instrument or effect onto a track by URI"""
+    def _load_sample_to_drum_pad(self, track_index, pad_note, item_uri):
+        """Load a sample into a specific drum rack pad by selecting the pad and loading."""
         try:
-            return self._load_browser_item(track_index, uri)
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index {0} out of range (0-{1})".format(
+                    track_index, len(self._song.tracks) - 1))
+            track = self._song.tracks[track_index]
+
+            # Find the first Drum Rack on the track
+            drum_rack = None
+            for device in track.devices:
+                if device.can_have_drum_pads:
+                    drum_rack = device
+                    break
+
+            if drum_rack is None:
+                raise ValueError("No Drum Rack found on track {0} ('{1}')".format(
+                    track_index, track.name))
+
+            # Find the drum pad matching pad_note
+            target_pad = None
+            for pad in drum_rack.drum_pads:
+                if pad.note == pad_note:
+                    target_pad = pad
+                    break
+
+            if target_pad is None:
+                raise ValueError("No drum pad found for note {0}".format(pad_note))
+
+            # Select the track and the drum pad
+            self._song.view.selected_track = track
+            drum_rack.view.selected_drum_pad = target_pad
+
+            # Find the browser item by URI or path
+            item = self._resolve_browser_item(item_uri)
+            if not item:
+                raise ValueError("Browser item with URI '{0}' not found".format(item_uri))
+
+            # Load the item into the selected pad
+            app = self.application()
+            app.browser.load_item(item)
+
+            return {
+                "loaded": True,
+                "pad_note": pad_note,
+                "item_name": item.name,
+                "track_name": track.name,
+                "track_index": track_index,
+                "uri": item_uri
+            }
         except Exception as e:
-            self.log_message("Error loading instrument or effect: {0}".format(str(e)))
+            self.log_message("Error loading sample to drum pad: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
             raise
+
+    def _find_browser_item_by_path(self, path):
+        """Find a browser item by navigating its path directly. Much faster than URI search.
+
+        Path format: "user_folders/FolderName/Sub/File.wav" or "Drums/Drum Rack"
+        Navigates step by step using children, case-insensitive matching.
+        """
+        try:
+            app = self.application()
+            if not app or not hasattr(app, 'browser'):
+                return None
+
+            parts = path.split("/")
+            if not parts:
+                return None
+
+            root = parts[0].lower()
+            category_map = {
+                "instruments": "instruments", "sounds": "sounds",
+                "drums": "drums", "audio_effects": "audio_effects",
+                "midi_effects": "midi_effects", "packs": "packs",
+                "user_library": "user_library",
+            }
+
+            current = None
+            nav_start = 1
+
+            if root == "user_folders" and hasattr(app.browser, 'user_folders'):
+                if len(parts) < 2:
+                    return None
+                folder_name = parts[1].lower()
+                for folder in app.browser.user_folders:
+                    if hasattr(folder, 'name') and folder.name.lower() == folder_name:
+                        current = folder
+                        break
+                if current is None:
+                    # Try partial match
+                    for folder in app.browser.user_folders:
+                        fname = folder.name.lower() if hasattr(folder, 'name') else ""
+                        if folder_name in fname:
+                            current = folder
+                            break
+                if current is None:
+                    return None
+                nav_start = 2
+            elif root in category_map and hasattr(app.browser, category_map[root]):
+                current = getattr(app.browser, category_map[root])
+            else:
+                return None
+
+            # Navigate through remaining path parts
+            for i in range(nav_start, len(parts)):
+                part = parts[i]
+                if not part:
+                    continue
+                if not hasattr(current, 'children'):
+                    return None
+                found = False
+                part_lower = part.lower()
+                for child in current.children:
+                    child_name = child.name.lower() if hasattr(child, 'name') else ""
+                    if child_name == part_lower:
+                        current = child
+                        found = True
+                        break
+                if not found:
+                    return None
+
+            return current
+        except Exception as e:
+            self.log_message("Error finding item by path: {0}".format(str(e)))
+            return None
+
+    def _resolve_browser_item(self, uri_or_path):
+        """Resolve a browser item from either a URI or a navigable path.
+
+        Tries path-based navigation first (fast), falls back to URI search (slow).
+        """
+        # Try path-based lookup first (if it looks like a path with slashes)
+        if "/" in uri_or_path:
+            item = self._find_browser_item_by_path(uri_or_path)
+            if item:
+                return item
+
+        # Fall back to URI search
+        app = self.application()
+        return self._find_browser_item_by_uri(app.browser, uri_or_path)
 
     def _find_browser_item_by_uri(self, browser_or_item, uri, max_depth=10, current_depth=0):
         """Recursively find a browser item by its URI"""
@@ -1935,14 +2192,23 @@ class AbletonMCP(ControlSurface):
             if current_depth >= max_depth:
                 return None
 
+            # At the browser root level, search ALL categories including user_folders
             if hasattr(browser_or_item, 'instruments'):
                 categories = [
                     browser_or_item.instruments,
                     browser_or_item.sounds,
                     browser_or_item.drums,
                     browser_or_item.audio_effects,
-                    browser_or_item.midi_effects
+                    browser_or_item.midi_effects,
                 ]
+                # Add packs and user_library if available
+                for attr in ('packs', 'user_library'):
+                    if hasattr(browser_or_item, attr):
+                        categories.append(getattr(browser_or_item, attr))
+                # Add user_folders (these contain artist sample packs)
+                if hasattr(browser_or_item, 'user_folders'):
+                    for folder in browser_or_item.user_folders:
+                        categories.append(folder)
                 for category in categories:
                     item = self._find_browser_item_by_uri(category, uri, max_depth, current_depth + 1)
                     if item:
@@ -1975,8 +2241,8 @@ class AbletonMCP(ControlSurface):
 
             query_lower = query.lower()
             results = []
-            max_results = 50
-            max_depth = 6
+            max_results = 20
+            max_depth = 3
 
             def walk(item, path, depth):
                 if depth > max_depth or len(results) >= max_results:
@@ -2009,6 +2275,8 @@ class AbletonMCP(ControlSurface):
                 "drums": "drums",
                 "audio_effects": "audio_effects",
                 "midi_effects": "midi_effects",
+                "packs": "packs",
+                "user_library": "user_library",
             }
 
             if category_type == "all":
@@ -2026,6 +2294,17 @@ class AbletonMCP(ControlSurface):
                         self.log_message("Error searching category {0}: {1}".format(cat_key, str(e)))
                 if len(results) >= max_results:
                     break
+
+            # Also search user folders (Places > added folders like PRODUCTION LIBS)
+            if len(results) < max_results and hasattr(browser, 'user_folders'):
+                try:
+                    for folder in browser.user_folders:
+                        folder_name = folder.name if hasattr(folder, 'name') else "Unknown"
+                        walk(folder, "user_folders/" + folder_name, 0)
+                        if len(results) >= max_results:
+                            break
+                except Exception as e:
+                    self.log_message("Error searching user folders: {0}".format(str(e)))
 
             return {
                 "query": query,
@@ -2140,9 +2419,51 @@ class AbletonMCP(ControlSurface):
                 "drums": "drums",
                 "audio_effects": "audio_effects",
                 "midi_effects": "midi_effects",
+                "packs": "packs",
+                "user_library": "user_library",
             }
 
-            if root_category in category_map and hasattr(app.browser, category_map[root_category]):
+            # nav_start: index in path_parts where subpath navigation begins
+            nav_start = 1
+
+            # Handle user_folders paths like "user_folders/PRODUCTION LIBS/..."
+            if root_category == "user_folders" and hasattr(app.browser, 'user_folders'):
+                if len(path_parts) <= 1:
+                    # Just "user_folders" — list all user folders
+                    items = []
+                    for folder in app.browser.user_folders:
+                        fname = folder.name if hasattr(folder, 'name') else "Unknown"
+                        items.append({
+                            "name": fname,
+                            "path": "user_folders/{0}".format(fname),
+                            "is_folder": True,
+                            "is_loadable": False,
+                        })
+                    return {"path": path, "items": items}
+                folder_name = path_parts[1]
+                current_item = None
+                for folder in app.browser.user_folders:
+                    if hasattr(folder, 'name') and folder.name == folder_name:
+                        current_item = folder
+                        break
+                if current_item is None:
+                    # Try case-insensitive and partial match
+                    folder_lower = folder_name.lower()
+                    for folder in app.browser.user_folders:
+                        fname = folder.name if hasattr(folder, 'name') else ""
+                        if fname.lower() == folder_lower or folder_lower in fname.lower():
+                            current_item = folder
+                            break
+                if current_item is None:
+                    available = [f.name for f in app.browser.user_folders if hasattr(f, 'name')]
+                    return {
+                        "path": path,
+                        "error": "User folder not found: {0}".format(folder_name),
+                        "available_folders": available,
+                        "items": [],
+                    }
+                nav_start = 2  # skip "user_folders" and folder name
+            elif root_category in category_map and hasattr(app.browser, category_map[root_category]):
                 current_item = getattr(app.browser, category_map[root_category])
             else:
                 found = False
@@ -2163,7 +2484,7 @@ class AbletonMCP(ControlSurface):
                         "items": []
                     }
 
-            for i in range(1, len(path_parts)):
+            for i in range(nav_start, len(path_parts)):
                 part = path_parts[i]
                 if not part:
                     continue
@@ -2195,19 +2516,14 @@ class AbletonMCP(ControlSurface):
                     item_info = {
                         "name": child.name if hasattr(child, 'name') else "Unknown",
                         "is_folder": hasattr(child, 'children') and bool(child.children),
-                        "is_device": hasattr(child, 'is_device') and child.is_device,
                         "is_loadable": hasattr(child, 'is_loadable') and child.is_loadable,
-                        "uri": child.uri if hasattr(child, 'uri') else None
                     }
+                    if hasattr(child, 'uri') and child.uri:
+                        item_info["uri"] = child.uri
                     items.append(item_info)
 
             result = {
                 "path": path,
-                "name": current_item.name if hasattr(current_item, 'name') else "Unknown",
-                "uri": current_item.uri if hasattr(current_item, 'uri') else None,
-                "is_folder": hasattr(current_item, 'children') and bool(current_item.children),
-                "is_device": hasattr(current_item, 'is_device') and current_item.is_device,
-                "is_loadable": hasattr(current_item, 'is_loadable') and current_item.is_loadable,
                 "items": items
             }
 

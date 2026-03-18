@@ -1,4 +1,4 @@
-"""Device and parameter control tools for AbletonMCP"""
+"""Device and instrument tools for AbletonMCP."""
 import json
 import logging
 from mcp.server.fastmcp import FastMCP
@@ -7,174 +7,128 @@ logger = logging.getLogger("AbletonMCPServer")
 
 
 def register(mcp: FastMCP, get_connection, cache):
-    """Register device tools with the MCP server"""
+    """Register device tools."""
+
+    @mcp.tool()
+    async def find_and_load_instrument(track_index: int, query: str, category: str = "") -> str:
+        """Find an instrument/effect in Ableton's browser and load it onto a track.
+
+        Browses Ableton's built-in categories to find matching items by name.
+        Much faster than search_browser for common instruments.
+
+        Args:
+            track_index: Track to load the instrument onto.
+            query: Name to search for (e.g. "Drum Rack", "Analog", "909", "Reverb").
+            category: Browser category to search. Leave empty to try common
+                categories automatically. Options: "instruments", "drums",
+                "sounds", "audio_effects", "midi_effects".
+        """
+        try:
+            conn = await get_connection()
+
+            # Determine which categories to search
+            if category:
+                categories_to_try = [category]
+            else:
+                # Smart category guessing based on query
+                q = query.lower()
+                if any(k in q for k in ("drum", "kit", "808", "909", "perc")):
+                    categories_to_try = ["drums", "instruments"]
+                elif any(k in q for k in ("reverb", "delay", "comp", "eq", "filter", "chorus")):
+                    categories_to_try = ["audio_effects"]
+                elif any(k in q for k in ("arp", "chord", "scale", "note")):
+                    categories_to_try = ["midi_effects"]
+                else:
+                    categories_to_try = ["sounds", "instruments", "drums"]
+
+            # Browse each category with filter
+            for cat in categories_to_try:
+                try:
+                    result = await conn.send_command("get_browser_items_at_path", {
+                        "path": cat.capitalize() if cat in ("drums", "instruments", "sounds") else cat,
+                    })
+                    items = result.get("items", [])
+                    query_lower = query.lower()
+                    for item in items:
+                        name = item.get("name", "")
+                        if query_lower in name.lower() and item.get("is_loadable"):
+                            uri = item.get("uri", "")
+                            if uri:
+                                await conn.send_command("load_browser_item", {
+                                    "track_index": track_index, "item_uri": uri,
+                                })
+                                cache.invalidate_all()
+                                return json.dumps({
+                                    "status": "loaded",
+                                    "track_index": track_index,
+                                    "instrument": name,
+                                    "category": cat,
+                                }, indent=2)
+                except Exception:
+                    continue
+
+            return json.dumps({
+                "error": "No loadable match for '{}' in {}".format(query, categories_to_try),
+                "tip": "Use browse_folder to navigate categories manually.",
+            })
+        except Exception as e:
+            logger.error("Error loading instrument: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
     async def get_device_parameters(track_index: int, device_index: int) -> str:
         """Get all parameters of a device on a track.
 
-        Returns a list of parameter dictionaries, each containing name, value,
-        min, max, and is_quantized fields. Useful for discovering available
-        parameters before setting them.
+        Returns parameter names, current values, min/max ranges, and whether
+        they're quantized. Use this before tweak_device to see what's available.
 
         Args:
-            track_index: Zero-based index of the track containing the device.
-            device_index: Zero-based index of the device on the track.
+            track_index: Track containing the device.
+            device_index: Device position on the track (0-based).
         """
         try:
-            cache_key = f"device_params_{track_index}_{device_index}"
+            cache_key = "device_params_{}_{}".format(track_index, device_index)
             cached = cache.get(cache_key)
             if cached is not None:
                 return cached
-
             conn = await get_connection()
-            result = await conn.send_command(
-                "get_device_parameters",
-                {"track_index": track_index, "device_index": device_index},
-            )
+            result = await conn.send_command("get_device_parameters", {
+                "track_index": track_index, "device_index": device_index,
+            })
             response = json.dumps(result, indent=2)
             cache.set(cache_key, response, ttl=2)
             return response
         except Exception as e:
-            logger.error(f"Error getting device parameters for track {track_index}, device {device_index}: {e}")
-            return f"Error getting device parameters for track {track_index}, device {device_index}: {e}"
+            logger.error("Error getting device parameters: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    async def set_device_parameter(track_index: int, device_index: int, parameter_index: int, value: float) -> str:
-        """Set a specific device parameter by its index.
+    async def tweak_device(
+        track_index: int,
+        device_index: int,
+        parameter_name: str,
+        value: float,
+    ) -> str:
+        """Adjust a device parameter by name.
 
-        Use get_device_parameters first to discover available parameters and
-        their valid ranges (min/max).
+        Use get_device_parameters first to see available parameters and ranges.
 
         Args:
-            track_index: Zero-based index of the track containing the device.
-            device_index: Zero-based index of the device on the track.
-            parameter_index: Zero-based index of the parameter to set.
-            value: The new value for the parameter. Must be within the
-                parameter's min/max range.
+            track_index: Track containing the device.
+            device_index: Device position on the track (0-based).
+            parameter_name: Parameter name (e.g. "Filter Freq", "Cutoff", "Decay").
+            value: New value (check ranges with get_device_parameters).
         """
         try:
             conn = await get_connection()
-            result = await conn.send_command(
-                "set_device_parameter",
-                {
-                    "track_index": track_index,
-                    "device_index": device_index,
-                    "parameter_index": parameter_index,
-                    "value": value,
-                },
-            )
+            result = await conn.send_command("set_device_parameter_by_name", {
+                "track_index": track_index,
+                "device_index": device_index,
+                "parameter_name": parameter_name,
+                "value": value,
+            })
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error setting device parameter for track {track_index}, device {device_index}, param {parameter_index}: {e}")
-            return f"Error setting device parameter for track {track_index}, device {device_index}, param {parameter_index}: {e}"
-
-    @mcp.tool()
-    async def set_device_parameter_by_name(track_index: int, device_index: int, parameter_name: str, value: float) -> str:
-        """Set a device parameter by its name instead of index.
-
-        More user-friendly than set_device_parameter since you can reference
-        parameters by name (e.g. "Filter Freq", "Resonance"). Use
-        get_device_parameters to discover available parameter names.
-
-        Args:
-            track_index: Zero-based index of the track containing the device.
-            device_index: Zero-based index of the device on the track.
-            parameter_name: The exact name of the parameter to set.
-            value: The new value for the parameter. Must be within the
-                parameter's min/max range.
-        """
-        try:
-            conn = await get_connection()
-            result = await conn.send_command(
-                "set_device_parameter_by_name",
-                {
-                    "track_index": track_index,
-                    "device_index": device_index,
-                    "parameter_name": parameter_name,
-                    "value": value,
-                },
-            )
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting parameter '{parameter_name}' for track {track_index}, device {device_index}: {e}")
-            return f"Error setting parameter '{parameter_name}' for track {track_index}, device {device_index}: {e}"
-
-    @mcp.tool()
-    async def toggle_device(track_index: int, device_index: int) -> str:
-        """Toggle a device on or off.
-
-        Flips the enabled/disabled state of the device. If the device is
-        currently active it will be bypassed, and vice versa.
-
-        Args:
-            track_index: Zero-based index of the track containing the device.
-            device_index: Zero-based index of the device on the track.
-        """
-        try:
-            conn = await get_connection()
-            result = await conn.send_command(
-                "toggle_device",
-                {"track_index": track_index, "device_index": device_index},
-            )
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error toggling device for track {track_index}, device {device_index}: {e}")
-            return f"Error toggling device for track {track_index}, device {device_index}: {e}"
-
-    @mcp.tool()
-    async def get_device_info(track_index: int, device_index: int) -> str:
-        """Get detailed information about a specific device.
-
-        Returns the device's name, class name, type, enabled state, and
-        parameter count. Useful for identifying what a device is before
-        querying or modifying its parameters.
-
-        Args:
-            track_index: Zero-based index of the track containing the device.
-            device_index: Zero-based index of the device on the track.
-        """
-        try:
-            cache_key = f"device_info_{track_index}_{device_index}"
-            cached = cache.get(cache_key)
-            if cached is not None:
-                return cached
-
-            conn = await get_connection()
-            result = await conn.send_command(
-                "get_device_info",
-                {"track_index": track_index, "device_index": device_index},
-            )
-            response = json.dumps(result, indent=2)
-            cache.set(cache_key, response, ttl=2)
-            return response
-        except Exception as e:
-            logger.error(f"Error getting device info for track {track_index}, device {device_index}: {e}")
-            return f"Error getting device info for track {track_index}, device {device_index}: {e}"
-
-    @mcp.tool()
-    async def delete_device(track_index: int, device_index: int) -> str:
-        """Delete a device from a track.
-
-        Permanently removes the device at the given index from the track's
-        device chain. This action cannot be undone via MCP (use Ableton's
-        undo if needed).
-
-        Args:
-            track_index: Zero-based index of the track containing the device.
-            device_index: Zero-based index of the device to remove.
-        """
-        try:
-            conn = await get_connection()
-            result = await conn.send_command(
-                "delete_device",
-                {"track_index": track_index, "device_index": device_index},
-            )
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error deleting device from track {track_index}, device {device_index}: {e}")
-            return f"Error deleting device from track {track_index}, device {device_index}: {e}"
+            logger.error("Error tweaking device: %s", e)
+            return json.dumps({"error": str(e)})

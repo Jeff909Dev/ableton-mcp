@@ -1,27 +1,119 @@
-"""Clip operation tools for AbletonMCP"""
+"""Clip manipulation tools for AbletonMCP."""
 import json
 import logging
-from typing import List, Dict, Union
+import re
+from typing import List, Dict
 from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger("AbletonMCPServer")
 
+# Key detection regex for sample filenames
+_KEY_PATTERN = re.compile(
+    r'[_\s-]([A-G][b#]?)\s*'       # note name: C, F#, Bb
+    r'(m(?:in(?:or)?)?|maj(?:or)?)?'  # optional mode: m, min, minor, maj, major
+    r'(?=[_\s.\-]|$)',               # followed by separator or end
+    re.IGNORECASE,
+)
+_BPM_PATTERN = re.compile(r'(\d{2,3})\s*bpm', re.IGNORECASE)
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+FLAT_TO_SHARP = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
 
 
+def _parse_key_from_name(name):
+    """Extract musical key from a filename. Returns e.g. 'Am', 'C', 'F#m' or None."""
+    match = _KEY_PATTERN.search(name)
+    if not match:
+        return None
+    note = match.group(1)
+    mode = match.group(2) or ""
+    # Normalize
+    note = note[0].upper() + note[1:]
+    if note in FLAT_TO_SHARP:
+        note = FLAT_TO_SHARP[note]
+    is_minor = mode.lower().startswith("m") if mode else False
+    return note + ("m" if is_minor else "")
 
+
+def _parse_bpm_from_name(name):
+    """Extract BPM from a filename. Returns int or None."""
+    match = _BPM_PATTERN.search(name)
+    if match:
+        bpm = int(match.group(1))
+        if 60 <= bpm <= 200:
+            return bpm
+    return None
+
+
+def _note_to_semitone(key):
+    """Convert key string to semitone offset (0-11). Returns (semitone, is_minor)."""
+    if not key:
+        return None, False
+    is_minor = key.endswith("m")
+    note = key.rstrip("m")
+    if note in FLAT_TO_SHARP:
+        note = FLAT_TO_SHARP[note]
+    if note in NOTE_NAMES:
+        return NOTE_NAMES.index(note), is_minor
+    return None, False
+
+
+def _transpose_semitones(from_key, to_key):
+    """Calculate semitones needed to transpose from_key to to_key.
+    For minor keys, transposes relative minor to relative minor."""
+    from_st, from_minor = _note_to_semitone(from_key)
+    to_st, to_minor = _note_to_semitone(to_key)
+    if from_st is None or to_st is None:
+        return 0
+    diff = (to_st - from_st) % 12
+    if diff > 6:
+        diff -= 12
+    return diff
 
 
 def register(mcp: FastMCP, get_connection, cache):
-    """Register clip tools with the MCP server"""
+    """Register clip tools."""
+
+    @mcp.tool()
+    async def create_audio_clip(
+        track_index: int, clip_index: int, file_path: str,
+    ) -> str:
+        """Load an audio file into a specific clip slot on an audio track.
+
+        Unlike load_browser_item (which always loads to slot 0), this tool
+        lets you place audio clips in ANY clip slot. Use this for building
+        session views with multiple loops organized by scene.
+
+        The file_path comes from browse_folder results (the "file_path" field).
+
+        Requires Ableton Live 12.0.5+.
+
+        Args:
+            track_index: Audio track index.
+            clip_index: Clip slot (scene) to place the audio clip in.
+            file_path: Full filesystem path to the audio file (WAV/AIF/FLAC).
+        """
+        try:
+            conn = await get_connection()
+            result = await conn.send_command("create_audio_clip", {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "file_path": file_path,
+            })
+            cache.invalidate_all()
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            logger.error("Error creating audio clip: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
     async def create_clip(track_index: int, clip_index: int, length: float = 4.0) -> str:
-        """Create a new MIDI clip in the specified track and clip slot.
+        """Create an empty MIDI clip.
 
         Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
-            length: The length of the clip in beats (default 4.0).
+            track_index: Track to create the clip on.
+            clip_index: Clip slot index.
+            length: Clip length in beats (4.0 = 1 bar). Default 4.0.
         """
         try:
             conn = await get_connection()
@@ -33,36 +125,27 @@ def register(mcp: FastMCP, get_connection, cache):
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error creating clip at track {track_index}, slot {clip_index}: {e}")
-            return f"Error creating clip at track {track_index}, slot {clip_index}: {e}"
+            logger.error("Error creating clip: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
     async def add_notes_to_clip(
         track_index: int,
         clip_index: int,
-        notes: List[Dict[str, Union[int, float, bool]]],
+        notes: List[Dict],
     ) -> str:
-        """Low-level: add raw MIDI notes to an existing clip.
+        """Add MIDI notes to an existing clip.
 
-        STOP — before using this tool, consider these alternatives that produce
-        much better results:
-        - generate_drums → drum/percussion patterns (10 genre styles)
-        - generate_bassline → bass patterns (trained on 391 real MIDI files)
-        - generate_melody → synth/keys/chords/pads/melody (trained on 500+ MIDI files)
+        For generating patterns, prefer create_beat, create_bassline,
+        create_melody, or create_chords — they handle the full workflow.
+        Use this only when you need to place specific individual notes.
 
-        Those tools create the clip AND write professionally-generated patterns in
-        one step. Only use add_notes_to_clip if you need to:
-        1. Append additional notes to an existing clip
-        2. Write a very specific, user-dictated note sequence
-        3. Layer notes on top of a generated pattern
-
-        Each note dict: {pitch: int, start_time: float, duration: float,
-        velocity: int, mute: bool}.
+        Note format: [{"pitch": 60, "start_time": 0.0, "duration": 1.0, "velocity": 100}]
 
         Args:
-            track_index: Zero-based index of the track.
-            clip_index: Zero-based index of the clip slot.
-            notes: List of note dictionaries.
+            track_index: Track containing the clip.
+            clip_index: Clip slot index.
+            notes: List of note dicts with pitch, start_time, duration, velocity.
         """
         try:
             conn = await get_connection()
@@ -74,38 +157,16 @@ def register(mcp: FastMCP, get_connection, cache):
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error adding notes to clip at track {track_index}, slot {clip_index}: {e}")
-            return f"Error adding notes to clip at track {track_index}, slot {clip_index}: {e}"
-
-    @mcp.tool()
-    async def set_clip_name(track_index: int, clip_index: int, name: str) -> str:
-        """Set the name of a clip.
-
-        Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
-            name: The new name for the clip.
-        """
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("set_clip_name", {
-                "track_index": track_index,
-                "clip_index": clip_index,
-                "name": name,
-            })
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting clip name at track {track_index}, slot {clip_index}: {e}")
-            return f"Error setting clip name at track {track_index}, slot {clip_index}: {e}"
+            logger.error("Error adding notes: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
     async def delete_clip(track_index: int, clip_index: int) -> str:
-        """Delete a clip from a clip slot.
+        """Delete a clip from a track.
 
         Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
+            track_index: Track containing the clip.
+            clip_index: Clip slot index.
         """
         try:
             conn = await get_connection()
@@ -116,26 +177,23 @@ def register(mcp: FastMCP, get_connection, cache):
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error deleting clip at track {track_index}, slot {clip_index}: {e}")
-            return f"Error deleting clip at track {track_index}, slot {clip_index}: {e}"
+            logger.error("Error deleting clip: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    async def duplicate_clip_to_slot(
+    async def duplicate_clip(
         track_index: int,
         clip_index: int,
         target_track: int,
         target_clip: int,
     ) -> str:
-        """Duplicate a clip to another slot.
-
-        Reads notes from the source clip, creates a new clip at the target
-        location, and writes the notes to it.
+        """Copy a clip to another slot.
 
         Args:
-            track_index: The zero-based index of the source track.
-            clip_index: The zero-based index of the source clip slot.
-            target_track: The zero-based index of the destination track.
-            target_clip: The zero-based index of the destination clip slot.
+            track_index: Source track.
+            clip_index: Source clip slot.
+            target_track: Destination track.
+            target_clip: Destination clip slot.
         """
         try:
             conn = await get_connection()
@@ -148,138 +206,96 @@ def register(mcp: FastMCP, get_connection, cache):
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(
-                f"Error duplicating clip from track {track_index}, slot {clip_index} "
-                f"to track {target_track}, slot {target_clip}: {e}"
-            )
-            return (
-                f"Error duplicating clip from track {track_index}, slot {clip_index} "
-                f"to track {target_track}, slot {target_clip}: {e}"
-            )
+            logger.error("Error duplicating clip: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    async def get_clip_notes(track_index: int, clip_index: int) -> str:
-        """Get all MIDI notes from a clip.
+    async def get_audio_clip_info(track_index: int, clip_index: int) -> str:
+        """Get properties of an audio clip (pitch, warp, gain, file path).
 
-        Returns a JSON array of note dictionaries, each containing pitch,
-        start_time, duration, velocity, and mute.
+        Use this to inspect audio clips after loading loops. Returns pitch
+        transpose, warp mode, gain, file path, and whether it's audio or MIDI.
 
         Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
+            track_index: Track containing the clip.
+            clip_index: Clip slot index.
         """
         try:
-            cache_key = f"clip_notes_{track_index}_{clip_index}"
-            cached = cache.get(cache_key)
-            if cached is not None:
-                return cached
-
             conn = await get_connection()
-            result = await conn.send_command("get_clip_notes", {
-                "track_index": track_index,
-                "clip_index": clip_index,
+            result = await conn.send_command("get_audio_clip_info", {
+                "track_index": track_index, "clip_index": clip_index,
             })
-            response = json.dumps(result, indent=2)
-            cache.set(cache_key, response, ttl=2)
-            return response
+            return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error getting clip notes at track {track_index}, slot {clip_index}: {e}")
-            return f"Error getting clip notes at track {track_index}, slot {clip_index}: {e}"
+            logger.error("Error getting audio clip info: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    async def remove_notes_from_clip(
-        track_index: int,
-        clip_index: int,
-        from_time: float = 0.0,
-        time_span: float = 999.0,
-        from_pitch: int = 0,
-        pitch_span: int = 127,
+    async def set_clip_pitch(
+        track_index: int, clip_index: int,
+        semitones: int = 0, cents: int = 0,
     ) -> str:
-        """Remove notes from a clip within the specified range.
+        """Transpose an audio clip by semitones and/or cents.
+
+        Use this to match an audio loop's key to the session key. For example,
+        if a loop is in Am and you need it in Cm, set semitones=3.
+
+        Only works on audio clips (not MIDI). Range: -48 to 48 semitones,
+        -500 to 500 cents.
 
         Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
-            from_time: Start of the time range in beats (default 0.0).
-            time_span: Length of the time range in beats (default 999.0).
-            from_pitch: Lowest MIDI pitch to remove (default 0).
-            pitch_span: Number of pitches above from_pitch to include (default 127).
+            track_index: Track containing the audio clip.
+            clip_index: Clip slot index.
+            semitones: Pitch shift in semitones (-48 to 48). Default 0.
+            cents: Fine pitch in cents (-500 to 500). Default 0.
         """
         try:
             conn = await get_connection()
-            result = await conn.send_command("remove_notes_from_clip", {
+            result = await conn.send_command("set_clip_pitch", {
                 "track_index": track_index,
                 "clip_index": clip_index,
-                "from_time": from_time,
-                "time_span": time_span,
-                "from_pitch": from_pitch,
-                "pitch_span": pitch_span,
+                "pitch_coarse": semitones,
+                "pitch_fine": cents,
             })
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error removing notes from clip at track {track_index}, slot {clip_index}: {e}")
-            return f"Error removing notes from clip at track {track_index}, slot {clip_index}: {e}"
+            logger.error("Error setting clip pitch: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    async def set_clip_loop(
-        track_index: int,
-        clip_index: int,
-        looping: bool = True,
-        loop_start: float = 0.0,
-        loop_end: float = 4.0,
+    async def set_clip_warp(
+        track_index: int, clip_index: int,
+        warping: bool = True, warp_mode: int = 0,
     ) -> str:
-        """Set clip loop settings.
+        """Set warp mode on an audio clip.
+
+        Warping enables time-stretching so loops play at the session tempo.
+        Different warp modes suit different material:
+          0 = beats (drums, percussion)
+          1 = complex (full mixes)
+          2 = complex_pro (high quality full mixes)
+          3 = repitch (like a turntable — changes pitch with tempo)
+          4 = rex (for REX files)
+          5 = texture (ambient, pads)
+          6 = tones (melodic, vocals, bass)
 
         Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
-            looping: Whether looping is enabled (default True).
-            loop_start: Loop start position in beats (default 0.0).
-            loop_end: Loop end position in beats (default 4.0).
+            track_index: Track containing the audio clip.
+            clip_index: Clip slot index.
+            warping: Enable warping. Default True.
+            warp_mode: Warp algorithm (0-6). Default 0 (beats).
         """
         try:
             conn = await get_connection()
-            result = await conn.send_command("set_clip_loop", {
+            result = await conn.send_command("set_clip_warp", {
                 "track_index": track_index,
                 "clip_index": clip_index,
-                "looping": looping,
-                "loop_start": loop_start,
-                "loop_end": loop_end,
+                "warping": warping,
+                "warp_mode": warp_mode,
             })
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error setting loop for clip at track {track_index}, slot {clip_index}: {e}")
-            return f"Error setting loop for clip at track {track_index}, slot {clip_index}: {e}"
-
-    @mcp.tool()
-    async def quantize_clip(
-        track_index: int,
-        clip_index: int,
-        quantization: int = 5,
-        amount: float = 1.0,
-    ) -> str:
-        """Quantize notes in a clip.
-
-        Args:
-            track_index: The zero-based index of the track.
-            clip_index: The zero-based index of the clip slot.
-            quantization: Quantization grid size (1=1 bar, 2=1/2, 3=1/4,
-                4=1/8, 5=1/16, 6=1/32). Default is 5 (1/16).
-            amount: Quantization strength from 0.0 (no change) to 1.0
-                (fully quantized). Default is 1.0.
-        """
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("quantize_clip", {
-                "track_index": track_index,
-                "clip_index": clip_index,
-                "quantization": quantization,
-                "amount": amount,
-            })
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error quantizing clip at track {track_index}, slot {clip_index}: {e}")
-            return f"Error quantizing clip at track {track_index}, slot {clip_index}: {e}"
+            logger.error("Error setting clip warp: %s", e)
+            return json.dumps({"error": str(e)})

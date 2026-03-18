@@ -1,144 +1,134 @@
-"""Track management tools for AbletonMCP"""
+"""Track management tools for AbletonMCP."""
 import json
 import logging
+from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger("AbletonMCPServer")
 
 
 def register(mcp: FastMCP, get_connection, cache):
-    """Register track tools with the MCP server"""
+    """Register track tools."""
 
     @mcp.tool()
-    async def create_midi_track(index: int = -1) -> str:
-        """Create a new MIDI track. Use index=-1 to add at the end of the track list."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("create_midi_track", {"index": index})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error creating MIDI track: {e}")
-            return f"Error creating MIDI track: {e}"
+    async def create_track(type: str = "midi", name: str = "") -> str:
+        """Create a new track.
 
-    @mcp.tool()
-    async def create_audio_track(index: int = -1) -> str:
-        """Create a new audio track. Use index=-1 to add at the end of the track list."""
+        Args:
+            type: "midi" or "audio". Default "midi".
+            name: Track name. Default empty (Ableton assigns default name).
+        """
         try:
             conn = await get_connection()
-            result = await conn.send_command("create_audio_track", {"index": index})
+            command = "create_midi_track" if type == "midi" else "create_audio_track"
+            result = await conn.send_command(command, {"index": -1})
+            track_index = result.get("index", 0)
+            if name:
+                await conn.send_command("set_track_name", {
+                    "track_index": track_index, "name": name,
+                })
             cache.invalidate_all()
-            return json.dumps(result, indent=2)
+            return json.dumps({
+                "status": "ok",
+                "track_index": track_index,
+                "type": type,
+                "name": name or "(default)",
+            }, indent=2)
         except Exception as e:
-            logger.error(f"Error creating audio track: {e}")
-            return f"Error creating audio track: {e}"
+            logger.error("Error creating track: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
     async def delete_track(track_index: int) -> str:
-        """Delete a track by index."""
+        """Delete a track.
+
+        Args:
+            track_index: Index of the track to delete.
+        """
         try:
             conn = await get_connection()
             result = await conn.send_command("delete_track", {"track_index": track_index})
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error deleting track: {e}")
-            return f"Error deleting track: {e}"
-
-    @mcp.tool()
-    async def duplicate_track(track_index: int) -> str:
-        """Duplicate a track."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("duplicate_track", {"track_index": track_index})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error duplicating track: {e}")
-            return f"Error duplicating track: {e}"
+            logger.error("Error deleting track: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
     async def set_track_name(track_index: int, name: str) -> str:
-        """Rename a track."""
+        """Rename a track.
+
+        Args:
+            track_index: Index of the track.
+            name: New name for the track.
+        """
         try:
             conn = await get_connection()
-            result = await conn.send_command("set_track_name", {"track_index": track_index, "name": name})
+            result = await conn.send_command("set_track_name", {
+                "track_index": track_index, "name": name,
+            })
             cache.invalidate_all()
             return json.dumps(result, indent=2)
         except Exception as e:
-            logger.error(f"Error setting track name: {e}")
-            return f"Error setting track name: {e}"
+            logger.error("Error renaming track: %s", e)
+            return json.dumps({"error": str(e)})
 
     @mcp.tool()
-    async def set_track_volume(track_index: int, volume: float) -> str:
-        """Set track volume (0.0 to 1.0, where 0.85 is approximately 0dB)."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("set_track_volume", {"track_index": track_index, "volume": volume})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting track volume: {e}")
-            return f"Error setting track volume: {e}"
+    async def mix_track(
+        track_index: int,
+        volume: Optional[float] = None,
+        pan: Optional[float] = None,
+        mute: Optional[bool] = None,
+        solo: Optional[bool] = None,
+    ) -> str:
+        """Adjust a track's mixer settings in one call.
 
-    @mcp.tool()
-    async def set_track_pan(track_index: int, pan: float) -> str:
-        """Set track panning (-1.0 left to 1.0 right, 0.0 center)."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("set_track_pan", {"track_index": track_index, "pan": pan})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting track pan: {e}")
-            return f"Error setting track pan: {e}"
+        All parameters are optional — only the ones you provide will be changed.
 
-    @mcp.tool()
-    async def set_track_mute(track_index: int, mute: bool) -> str:
-        """Mute or unmute a track."""
+        Args:
+            track_index: Index of the track.
+            volume: Volume (0.0 to 1.0, where ~0.85 = 0dB). Optional.
+            pan: Pan (-1.0 = left, 0.0 = center, 1.0 = right). Optional.
+            mute: Mute state. Optional.
+            solo: Solo state. Optional.
+        """
         try:
             conn = await get_connection()
-            result = await conn.send_command("set_track_mute", {"track_index": track_index, "mute": mute})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting track mute: {e}")
-            return f"Error setting track mute: {e}"
+            changes = []
 
-    @mcp.tool()
-    async def set_track_solo(track_index: int, solo: bool) -> str:
-        """Solo or unsolo a track."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("set_track_solo", {"track_index": track_index, "solo": solo})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting track solo: {e}")
-            return f"Error setting track solo: {e}"
+            if volume is not None:
+                await conn.send_command("set_track_volume", {
+                    "track_index": track_index, "volume": volume,
+                })
+                changes.append("volume={}".format(volume))
 
-    @mcp.tool()
-    async def set_track_arm(track_index: int, arm: bool) -> str:
-        """Arm or disarm a track for recording."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command("set_track_arm", {"track_index": track_index, "arm": arm})
-            cache.invalidate_all()
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            logger.error(f"Error setting track arm: {e}")
-            return f"Error setting track arm: {e}"
+            if pan is not None:
+                await conn.send_command("set_track_pan", {
+                    "track_index": track_index, "pan": pan,
+                })
+                changes.append("pan={}".format(pan))
 
-    @mcp.tool()
-    async def set_track_send(track_index: int, send_index: int, value: float) -> str:
-        """Set the send level for a track's send (0.0 to 1.0)."""
-        try:
-            conn = await get_connection()
-            result = await conn.send_command(
-                "set_track_send", {"track_index": track_index, "send_index": send_index, "value": value}
-            )
+            if mute is not None:
+                await conn.send_command("set_track_mute", {
+                    "track_index": track_index, "mute": mute,
+                })
+                changes.append("mute={}".format(mute))
+
+            if solo is not None:
+                await conn.send_command("set_track_solo", {
+                    "track_index": track_index, "solo": solo,
+                })
+                changes.append("solo={}".format(solo))
+
+            if not changes:
+                return json.dumps({"status": "no changes", "track_index": track_index})
+
             cache.invalidate_all()
-            return json.dumps(result, indent=2)
+            return json.dumps({
+                "status": "ok",
+                "track_index": track_index,
+                "changes": changes,
+            }, indent=2)
         except Exception as e:
-            logger.error(f"Error setting track send: {e}")
-            return f"Error setting track send: {e}"
+            logger.error("Error mixing track: %s", e)
+            return json.dumps({"error": str(e)})

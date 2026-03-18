@@ -20,7 +20,7 @@ logger = logging.getLogger("AbletonMCPServer")
 class AbletonConnection:
     """Async TCP connection to the Ableton Remote Script"""
 
-    def __init__(self, host: str = "localhost", port: int = 9877, timeout: float = 10.0):
+    def __init__(self, host: str = "localhost", port: int = 9877, timeout: float = 15.0):
         self.host = host
         self.port = port
         self.timeout = timeout
