@@ -1,6 +1,7 @@
 """Device and instrument tools for AbletonMCP."""
 import json
 import logging
+from typing import Union
 from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger("AbletonMCPServer")
@@ -10,7 +11,7 @@ def register(mcp: FastMCP, get_connection, cache):
     """Register device tools."""
 
     @mcp.tool()
-    async def find_and_load_instrument(track_index: int, query: str, category: str = "") -> str:
+    async def find_and_load_instrument(track_index: int, query: Union[str, int], category: str = "") -> str:
         """Find an instrument/effect in Ableton's browser and load it onto a track.
 
         Browses Ableton's built-in categories to find matching items by name.
@@ -24,6 +25,7 @@ def register(mcp: FastMCP, get_connection, cache):
                 "sounds", "audio_effects", "midi_effects".
         """
         try:
+            query = str(query)
             conn = await get_connection()
 
             # Determine which categories to search
@@ -41,14 +43,31 @@ def register(mcp: FastMCP, get_connection, cache):
                 else:
                     categories_to_try = ["sounds", "instruments", "drums"]
 
-            # Browse each category with filter
+            query_lower = query.lower()
+
+            # Build browsable paths — for drums, include known subpaths where
+            # kits actually live (e.g. Drums/Drum Rack, Drums/Drum Hits)
+            browse_paths = []
             for cat in categories_to_try:
+                base = cat.capitalize() if cat in ("drums", "instruments", "sounds") else cat
+                if cat == "drums":
+                    browse_paths.extend([
+                        (base + "/Drum Rack", cat),
+                        (base + "/Drum Hits", cat),
+                        (base, cat),
+                    ])
+                else:
+                    browse_paths.append((base, cat))
+
+            # Browse each path, searching up to 2 levels deep
+            for browse_path, cat in browse_paths:
                 try:
                     result = await conn.send_command("get_browser_items_at_path", {
-                        "path": cat.capitalize() if cat in ("drums", "instruments", "sounds") else cat,
+                        "path": browse_path,
                     })
                     items = result.get("items", [])
-                    query_lower = query.lower()
+
+                    # Level 1: check items at this path
                     for item in items:
                         name = item.get("name", "")
                         if query_lower in name.lower() and item.get("is_loadable"):
@@ -64,6 +83,34 @@ def register(mcp: FastMCP, get_connection, cache):
                                     "instrument": name,
                                     "category": cat,
                                 }, indent=2)
+
+                    # Level 2: descend into non-loadable subfolders
+                    for item in items:
+                        if item.get("is_folder") and not item.get("is_loadable"):
+                            subfolder = "{}/{}".format(browse_path, item["name"])
+                            try:
+                                sub_result = await conn.send_command(
+                                    "get_browser_items_at_path", {"path": subfolder},
+                                )
+                                for sub_item in sub_result.get("items", []):
+                                    sub_name = sub_item.get("name", "")
+                                    if (query_lower in sub_name.lower()
+                                            and sub_item.get("is_loadable")):
+                                        sub_uri = sub_item.get("uri", "")
+                                        if sub_uri:
+                                            await conn.send_command("load_browser_item", {
+                                                "track_index": track_index,
+                                                "item_uri": sub_uri,
+                                            })
+                                            cache.invalidate_all()
+                                            return json.dumps({
+                                                "status": "loaded",
+                                                "track_index": track_index,
+                                                "instrument": sub_name,
+                                                "category": cat,
+                                            }, indent=2)
+                            except Exception:
+                                continue
                 except Exception:
                     continue
 

@@ -147,14 +147,29 @@ ClipSlot
 
 Search the web: `site:github.com cylab AbletonLive-API-Stub ClassName method_name`
 
+## Claude Code Configuration
+
+- **`.mcp.json`**: Configures the Ableton MCP server for Claude Code. Server name is `ableton`, so tools appear as `mcp__ableton__<tool_name>`.
+- **`.claude/settings.json`**: Contains PreToolUse hook configuration.
+- **`.claude/hooks/ableton-pretool.mjs`**: PreToolUse hook that runs before every Ableton MCP tool call. It:
+  1. **Fixes numeric string coercion** — converts `909` (int) to `"909"` (str) for parameters like `sound`, `query`, `name` that Pydantic expects as strings. Numeric params (`track_index`, `bars`, `pad_note`, etc.) are left as numbers.
+  2. **Validates enum values** — warns about invalid `style`, `category`, `type`, and `warp_mode` values.
+
+### Known pitfalls
+
+- **Numeric-looking strings**: Values like "909", "808", "303" get JSON-serialized as integers. The PreToolUse hook fixes this automatically.
+- **Connection timeouts**: The Remote Script socket can drop if Ableton is busy (loading samples, rendering). Retry after connection lost errors.
+- **Browser search is slow**: `search_browser` does recursive tree traversal. Prefer `browse_folder` with a known path, or `find_and_load_instrument` for instruments.
+- **Instrument load failures are silent**: Production tools (`create_beat`, etc.) generate MIDI notes even when the instrument fails to load. Always check the result message for "no instrument loaded" warnings.
+
 ## Key Constraints
 
-- **Remote Script must stay Python 2.7 compatible**: no f-strings, use `.format()`, `from __future__` imports, `Queue`/`queue` dual import.
+- **Remote Script must stay Python 2/3 compatible**: uses `from __future__` imports, `.format()`, `Queue`/`queue` dual import. No f-strings.
 - **Remote Script is a single file**: Ableton loads `__init__.py` from the Remote Scripts folder.
 - **State-modifying commands must use `schedule_message`**: Ableton's API is not thread-safe. Write commands go through `self.schedule_message(0, callback)` with a Queue.
 - **MCP Server tools are async**: All tools use `async def` and `await conn.send_command(...)`.
 - **No hardcoded user data in tool descriptions**: Never put user-specific folder names, artist names, or paths in tool descriptions. Keep them generic.
-- **Prefer `get_browser_items_at_path` over `search_browser`**: Direct path browsing is fast; recursive search causes timeouts.
+- **Prefer path browsing over search**: Internal function `_find_browser_item_by_path` (used by `browse_folder`, `find_and_load_instrument`) walks the tree directly. `search_browser` does recursive traversal and can timeout on large libraries.
 
 ## Adding New Tools
 

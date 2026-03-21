@@ -17,6 +17,9 @@ except ImportError:
 # Constants for socket communication
 DEFAULT_PORT = 9877
 HOST = "localhost"
+RECV_TIMEOUT = 60.0      # seconds; prevents blocking forever on dropped clients
+WRITE_CMD_TIMEOUT = 30.0  # seconds; long enough for build_drum_rack / browser loads
+MAX_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB; reject obviously broken data
 
 
 def create_instance(c_instance):
@@ -61,6 +64,8 @@ class AbletonMCP(ControlSurface):
     def _build_command_registry(self):
         """Build the command handler registry and read/write classification."""
         self._command_handlers = {
+            # Health check
+            "ping": self._ping_handler,
             # Session (read-only)
             "get_session_info": self._get_session_info_handler,
             "get_track_info": self._get_track_info_handler,
@@ -140,6 +145,7 @@ class AbletonMCP(ControlSurface):
 
         # Read-only commands execute directly on the socket thread
         self._read_commands = {
+            "ping",
             "get_session_info",
             "get_track_info",
             "get_all_tracks_info",
@@ -214,7 +220,13 @@ class AbletonMCP(ControlSurface):
     # ------------------------------------------------------------------
 
     def disconnect(self):
-        """Called when Ableton closes or the control surface is removed"""
+        """Called when Ableton closes or the control surface is removed.
+
+        Sets running=False so all threads exit their loops, closes the
+        server socket (unblocks accept), and waits briefly for threads.
+        Client handler threads will notice running=False on their next
+        recv timeout cycle and clean up their own sockets.
+        """
         self.log_message("AbletonMCP disconnecting...")
         self.running = False
 
@@ -225,11 +237,17 @@ class AbletonMCP(ControlSurface):
                 pass
 
         if self.server_thread and self.server_thread.is_alive():
-            self.server_thread.join(1.0)
+            self.server_thread.join(2.0)
 
+        # Give client threads a moment to finish; they are daemon threads
+        # so they will not block Ableton from quitting.
         for client_thread in self.client_threads[:]:
             if client_thread.is_alive():
-                self.log_message("Client thread still alive during disconnect")
+                client_thread.join(1.0)
+                if client_thread.is_alive():
+                    self.log_message("Client thread still alive during disconnect")
+
+        self.client_threads = []
 
         ControlSurface.disconnect(self)
         self.log_message("AbletonMCP disconnected")
@@ -265,6 +283,10 @@ class AbletonMCP(ControlSurface):
             while self.running:
                 try:
                     client, address = self.server.accept()
+                    # Enable TCP keepalive so the OS detects dead peers
+                    client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    # Disable Nagle for low-latency command/response
+                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     self.log_message("Connection accepted from " + str(address))
                     self.show_message("AbletonMCP: Client connected")
 
@@ -290,74 +312,125 @@ class AbletonMCP(ControlSurface):
             self.log_message("Server thread error: " + str(e))
 
     def _handle_client(self, client):
-        """Handle communication with a connected client"""
+        """Handle communication with a connected client.
+
+        Key robustness features:
+        - recv timeout so a dropped client does not block the thread forever
+        - Buffer size cap to reject runaway/corrupt data
+        - Graceful handling of broken pipe on send
+        - Proper socket shutdown on any exit path
+        """
         self.log_message("Client handler started")
-        client.settimeout(None)
+        # Set a recv timeout so we periodically wake up and check self.running
+        # even if the client disappears without sending FIN.
+        client.settimeout(RECV_TIMEOUT)
         buffer = ''
 
         try:
             while self.running:
+                # -- receive data ------------------------------------------
                 try:
                     data = client.recv(8192)
+                except socket.timeout:
+                    # No data within RECV_TIMEOUT -- loop back and recheck
+                    # self.running.  The client connection is still alive.
+                    continue
+                except (socket.error, OSError) as e:
+                    self.log_message("Socket recv error: " + str(e))
+                    break
 
-                    if not data:
-                        self.log_message("Client disconnected")
+                if not data:
+                    self.log_message("Client disconnected (recv returned empty)")
+                    break
+
+                # -- accumulate into buffer --------------------------------
+                try:
+                    buffer += data.decode('utf-8')
+                except (AttributeError, UnicodeDecodeError):
+                    # Python 2 str or encoding issue
+                    try:
+                        buffer += data
+                    except TypeError:
+                        self.log_message("Undecodable data received, dropping connection")
                         break
 
-                    try:
-                        buffer += data.decode('utf-8')
-                    except AttributeError:
-                        buffer += data
+                # Guard against unbounded buffer growth from bad data
+                if len(buffer) > MAX_BUFFER_SIZE:
+                    self.log_message("Buffer overflow ({0} bytes), dropping connection".format(len(buffer)))
+                    break
 
-                    try:
-                        command = json.loads(buffer)
-                        buffer = ''
+                # -- try to parse a complete JSON message ------------------
+                try:
+                    command = json.loads(buffer)
+                except ValueError:
+                    # Incomplete JSON -- wait for more data
+                    continue
 
-                        # Batch command support: if the payload is a list,
-                        # process each command individually and return an array.
-                        if isinstance(command, list):
-                            responses = []
-                            for cmd in command:
-                                responses.append(self._process_command(cmd))
-                            response_str = json.dumps(responses, ensure_ascii=False)
-                        else:
-                            self.log_message("Received command: " + str(command.get("type", "unknown")))
-                            response = self._process_command(command)
-                            response_str = json.dumps(response, ensure_ascii=False)
+                # Successfully parsed; clear buffer before processing so a
+                # slow command does not leave stale data around.
+                buffer = ''
 
-                        try:
-                            client.sendall(response_str.encode('utf-8'))
-                        except AttributeError:
-                            client.sendall(response_str)
-                    except ValueError:
-                        # Incomplete JSON, wait for more data
-                        continue
-
+                # -- process and respond -----------------------------------
+                try:
+                    if isinstance(command, list):
+                        # Batch command support
+                        responses = []
+                        for cmd in command:
+                            responses.append(self._process_command(cmd))
+                        response_str = json.dumps(responses, ensure_ascii=False)
+                    else:
+                        self.log_message("Received command: " + str(command.get("type", "unknown")))
+                        response = self._process_command(command)
+                        response_str = json.dumps(response, ensure_ascii=False)
                 except Exception as e:
-                    self.log_message("Error handling client data: " + str(e))
+                    self.log_message("Error processing command: " + str(e))
                     self.log_message(traceback.format_exc())
-
-                    error_response = {
+                    response_str = json.dumps({
                         "status": "error",
                         "message": str(e)
-                    }
-                    try:
-                        client.sendall(json.dumps(error_response, ensure_ascii=False).encode('utf-8'))
-                    except AttributeError:
-                        client.sendall(json.dumps(error_response, ensure_ascii=False))
-                    except Exception:
-                        break
+                    }, ensure_ascii=False)
 
-                    if not isinstance(e, ValueError):
-                        break
+                # -- send the response back --------------------------------
+                if not self._send_response(client, response_str):
+                    break  # send failed (broken pipe etc.), exit loop
+
         except Exception as e:
-            self.log_message("Error in client handler: " + str(e))
+            self.log_message("Unexpected error in client handler: " + str(e))
+            self.log_message(traceback.format_exc())
         finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            self._close_client(client)
             self.log_message("Client handler stopped")
+
+    def _send_response(self, client, response_str):
+        """Send a JSON response string to the client socket.
+
+        Returns True on success, False if the connection is broken.
+        """
+        try:
+            payload = response_str.encode('utf-8')
+        except AttributeError:
+            payload = response_str  # Python 2 str
+
+        try:
+            client.sendall(payload)
+            return True
+        except (socket.error, OSError) as e:
+            self.log_message("Send failed (broken pipe): " + str(e))
+            return False
+        except Exception as e:
+            self.log_message("Send failed: " + str(e))
+            return False
+
+    def _close_client(self, client):
+        """Cleanly shut down and close a client socket."""
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except (socket.error, OSError):
+            pass  # already disconnected
+        try:
+            client.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -402,7 +475,7 @@ class AbletonMCP(ControlSurface):
                     main_thread_task()
 
                 try:
-                    task_response = response_queue.get(timeout=10.0)
+                    task_response = response_queue.get(timeout=WRITE_CMD_TIMEOUT)
                     if task_response.get("status") == "error":
                         response["status"] = "error"
                         response["message"] = task_response.get("message", "Unknown error")
@@ -410,7 +483,8 @@ class AbletonMCP(ControlSurface):
                         response["result"] = task_response.get("result", {})
                 except queue.Empty:
                     response["status"] = "error"
-                    response["message"] = "Timeout waiting for operation to complete"
+                    response["message"] = "Timeout ({0}s) waiting for '{1}' to complete".format(
+                        WRITE_CMD_TIMEOUT, command_type)
             else:
                 # Fallback: execute directly
                 response["result"] = handler(params)
@@ -426,6 +500,12 @@ class AbletonMCP(ControlSurface):
     # ------------------------------------------------------------------
     # Handler wrappers (extract params dict -> call implementation)
     # ------------------------------------------------------------------
+
+    # -- Health check --------------------------------------------------
+
+    def _ping_handler(self, params):
+        """Lightweight health check — no Live API calls needed."""
+        return {"status": "ok"}
 
     # -- Session / read-only -------------------------------------------
 
@@ -2226,12 +2306,31 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
             return None
 
+    # Subtree names that contain thousands of raw WAV samples with
+    # unhelpful names.  Descending into these is almost never useful
+    # and extremely expensive, so _search_browser skips them.
+    _SKIP_SUBTREES = frozenset([
+        "samples", "consolidated", "recorded",
+        "imported", "bounced", "rendered",
+    ])
+
     def _search_browser(self, query, category_type="all"):
         """Search through browser items matching a query string.
 
         Walks the browser tree and collects items whose name contains the
-        query (case-insensitive). Limits depth and result count for
-        performance.
+        query (case-insensitive).
+
+        Performance optimisations (vs the original naive recursive walk):
+        - Timing guard: bails out at 10 s so we never hit the 15 s
+          socket timeout.
+        - Uses the BrowserItem .is_folder property (cheap bool read)
+          instead of bool(.children) which forces Ableton to lazily
+          enumerate the entire children list just to check emptiness.
+        - Skips known-heavy subtrees ("Samples", raw WAV dump folders)
+          that rarely contain useful named presets.
+        - max_depth raised to 6 (from 2) so nested pack content is
+          reachable; the timing guard keeps total wall-time safe.
+        - Early-exit checks at the top of every walk() call.
         """
         try:
             app = self.application()
@@ -2242,30 +2341,68 @@ class AbletonMCP(ControlSurface):
             query_lower = query.lower()
             results = []
             max_results = 20
-            max_depth = 3
+            max_depth = 6
+            start_time = time.time()
+            time_limit = 10.0  # seconds -- well under the 15 s socket timeout
+            timed_out = [False]   # list so the nested function can mutate it
+            nodes_visited = [0]
+
+            skip_subtrees = self._SKIP_SUBTREES
 
             def walk(item, path, depth):
-                if depth > max_depth or len(results) >= max_results:
+                # ---------- fast bail-outs ----------
+                if timed_out[0] or len(results) >= max_results:
                     return
+                if depth > max_depth:
+                    return
+
+                # Timing guard -- check every 50 nodes to keep the
+                # overhead of time.time() negligible.
+                nodes_visited[0] += 1
+                if nodes_visited[0] % 50 == 0:
+                    if time.time() - start_time >= time_limit:
+                        timed_out[0] = True
+                        return
+
                 try:
                     name = item.name if hasattr(item, 'name') else ""
-                    if query_lower in name.lower():
+                    name_lower = name.lower()
+
+                    # Record a match.  Use .is_folder property (a cheap
+                    # bool read on BrowserItem) instead of
+                    # bool(.children) which triggers Ableton to load
+                    # the full children list.
+                    if query_lower in name_lower:
+                        is_folder = hasattr(item, 'is_folder') and item.is_folder
                         entry = {
                             "name": name,
                             "path": path,
-                            "is_folder": hasattr(item, 'children') and bool(item.children),
+                            "is_folder": is_folder,
                             "is_device": hasattr(item, 'is_device') and item.is_device,
                             "is_loadable": hasattr(item, 'is_loadable') and item.is_loadable,
                         }
                         if hasattr(item, 'uri'):
                             entry["uri"] = item.uri
                         results.append(entry)
-                    if hasattr(item, 'children') and item.children:
-                        child_path = path + "/" + name if path else name
-                        for child in item.children:
-                            if len(results) >= max_results:
-                                break
-                            walk(child, child_path, depth + 1)
+                        if len(results) >= max_results:
+                            return
+
+                    # --- decide whether to descend into children ---
+
+                    # 1) Skip subtrees that are just huge WAV dumps.
+                    if name_lower in skip_subtrees:
+                        return
+
+                    # 2) Use .is_folder to decide without touching
+                    #    .children (which is the expensive part).
+                    if not (hasattr(item, 'is_folder') and item.is_folder):
+                        return
+
+                    child_path = path + "/" + name if path else name
+                    for child in item.children:
+                        if len(results) >= max_results or timed_out[0]:
+                            break
+                        walk(child, child_path, depth + 1)
                 except Exception as e:
                     self.log_message("Error walking browser item: {0}".format(str(e)))
 
@@ -2292,26 +2429,36 @@ class AbletonMCP(ControlSurface):
                         walk(root, cat_key, 0)
                     except Exception as e:
                         self.log_message("Error searching category {0}: {1}".format(cat_key, str(e)))
-                if len(results) >= max_results:
+                if len(results) >= max_results or timed_out[0]:
                     break
 
-            # Also search user folders (Places > added folders like PRODUCTION LIBS)
-            if len(results) < max_results and hasattr(browser, 'user_folders'):
+            # Skip user folders in default search -- they can be huge and are
+            # better explored with browse_folder / list_user_folders.
+            # Only search user folders when the user explicitly picks that category.
+            if category_type == "user_folders" and len(results) < max_results and not timed_out[0] and hasattr(browser, 'user_folders'):
                 try:
                     for folder in browser.user_folders:
                         folder_name = folder.name if hasattr(folder, 'name') else "Unknown"
                         walk(folder, "user_folders/" + folder_name, 0)
-                        if len(results) >= max_results:
+                        if len(results) >= max_results or timed_out[0]:
                             break
                 except Exception as e:
                     self.log_message("Error searching user folders: {0}".format(str(e)))
+
+            elapsed = round(time.time() - start_time, 2)
+            self.log_message(
+                "Browser search for '{0}': {1} results, {2} nodes, {3}s{4}".format(
+                    query, len(results), nodes_visited[0], elapsed,
+                    " (timed out)" if timed_out[0] else ""))
 
             return {
                 "query": query,
                 "category_type": category_type,
                 "results": results,
                 "result_count": len(results),
-                "truncated": len(results) >= max_results
+                "truncated": len(results) >= max_results or timed_out[0],
+                "timed_out": timed_out[0],
+                "elapsed_seconds": elapsed,
             }
         except Exception as e:
             self.log_message("Error searching browser: " + str(e))
@@ -2341,7 +2488,7 @@ class AbletonMCP(ControlSurface):
                     return None
                 return {
                     "name": item.name if hasattr(item, 'name') else "Unknown",
-                    "is_folder": hasattr(item, 'children') and bool(item.children),
+                    "is_folder": hasattr(item, 'is_folder') and item.is_folder,
                     "is_device": hasattr(item, 'is_device') and item.is_device,
                     "is_loadable": hasattr(item, 'is_loadable') and item.is_loadable,
                     "uri": item.uri if hasattr(item, 'uri') else None,
@@ -2515,7 +2662,7 @@ class AbletonMCP(ControlSurface):
                 for child in current_item.children:
                     item_info = {
                         "name": child.name if hasattr(child, 'name') else "Unknown",
-                        "is_folder": hasattr(child, 'children') and bool(child.children),
+                        "is_folder": hasattr(child, 'is_folder') and child.is_folder,
                         "is_loadable": hasattr(child, 'is_loadable') and child.is_loadable,
                     }
                     if hasattr(child, 'uri') and child.uri:

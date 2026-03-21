@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*ableton.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $CLAUDE_PROJECT_DIR/.claude/hooks/ableton-pretool.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

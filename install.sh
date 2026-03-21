@@ -25,9 +25,9 @@ else
     exit 1
 fi
 
-# --- Step 2: Build MIDI pattern models (if not already built) ---
+# --- Step 2: Build MIDI pattern index ---
 echo ""
-echo "[2/3] Building MIDI pattern models..."
+echo "[2/3] Building MIDI pattern index..."
 
 # Determine which Python to use
 if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
@@ -38,42 +38,34 @@ else
     PY="python"
 fi
 
-# Install mido if not present
-$PY -c "import mido" 2>/dev/null || $PY -m pip install mido -q
+INDEX_FILE="$SCRIPT_DIR/midi_patterns/index.json"
 
-MODELS_SRC="$SCRIPT_DIR/midi_patterns/markov_models.json"
-MODELS_PKG="$SCRIPT_DIR/MCP_Server/data/markov_models.json"
-
-if [ -f "$MODELS_SRC" ]; then
-    echo "  Markov models found (midi_patterns/markov_models.json)."
-    echo "  To rebuild: $PY scripts/build_pattern_index.py && $PY scripts/build_markov_models.py"
+if [ -f "$INDEX_FILE" ]; then
+    echo "  Pattern index found (midi_patterns/index.json)."
+    echo "  To rebuild: $PY scripts/build_pattern_index.py"
 else
-    # Need to build from MIDI files
+    # Install mido if not present
+    $PY -c "import mido" 2>/dev/null || $PY -m pip install mido -q
+
     if ls "$SCRIPT_DIR/midi_patterns/"*/*.mid 1>/dev/null 2>&1; then
         echo "  Building pattern index from MIDI files..."
         $PY "$SCRIPT_DIR/scripts/build_pattern_index.py"
-        echo "  Training Markov models..."
-        $PY "$SCRIPT_DIR/scripts/build_markov_models.py"
     else
-        echo "  WARNING: No MIDI patterns found and no pre-built models."
+        echo "  WARNING: No MIDI patterns found and no pre-built index."
         echo "  Pattern generation will use fallback templates."
         echo "  To add patterns: place .mid files in midi_patterns/{bass,drums,synth,...}/"
     fi
-fi
-
-# Copy models into the Python package so the server is self-contained
-if [ -f "$MODELS_SRC" ]; then
-    mkdir -p "$SCRIPT_DIR/MCP_Server/data"
-    cp "$MODELS_SRC" "$MODELS_PKG"
-    echo "  Models bundled into MCP_Server/data/ for self-contained operation."
 fi
 
 # --- Step 3: Install the Remote Script into Ableton ---
 echo ""
 echo "[3/3] Installing Ableton Remote Script..."
 
-# Find MIDI Remote Scripts inside Ableton app bundles
+# Find User Remote Scripts in Ableton Preferences (preferred) and app bundles
 DIRS=()
+while IFS= read -r -d '' dir; do
+    DIRS+=("$dir")
+done < <(find "$HOME/Library/Preferences/Ableton" -maxdepth 3 -type d -name "User Remote Scripts" -print0 2>/dev/null)
 while IFS= read -r -d '' dir; do
     DIRS+=("$dir")
 done < <(find /Applications -maxdepth 5 -type d -name "MIDI Remote Scripts" -path "*/Ableton*" -print0 2>/dev/null)

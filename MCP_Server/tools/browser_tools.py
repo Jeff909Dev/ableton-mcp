@@ -20,7 +20,7 @@ def register(mcp: FastMCP, get_connection, cache):
     """Register browser tools."""
 
     @mcp.tool()
-    async def search_browser(query: str, category: str = "all") -> str:
+    async def search_browser(query: Union[str, int], category: str = "all") -> str:
         """Search Ableton's browser for instruments, effects, presets, and samples.
 
         Searches across Ableton's entire content library including factory packs,
@@ -52,6 +52,7 @@ def register(mcp: FastMCP, get_connection, cache):
             category: Browser category to search. Default "all".
         """
         try:
+            query = str(query)
             valid_categories = {
                 "all", "instruments", "sounds", "drums",
                 "audio_effects", "midi_effects", "packs", "user_library",
@@ -68,9 +69,26 @@ def register(mcp: FastMCP, get_connection, cache):
                 return cached
 
             conn = await get_connection()
-            result = await conn.send_command("search_browser", {
-                "query": query, "category_type": category,
-            })
+            try:
+                result = await conn.send_command("search_browser", {
+                    "query": query, "category_type": category,
+                }, timeout=30.0)
+            except Exception as first_err:
+                # Browser search can be slow on large libraries — if we hit a
+                # timeout or connection drop, reconnect and retry once.
+                err_str = str(first_err)
+                is_retryable = (
+                    isinstance(first_err, (ConnectionError, BrokenPipeError, ConnectionResetError))
+                    or "Timeout" in err_str
+                    or "Connection closed" in err_str
+                )
+                if not is_retryable:
+                    raise
+                logger.warning("search_browser failed (%s), reconnecting and retrying", first_err)
+                conn = await get_connection()
+                result = await conn.send_command("search_browser", {
+                    "query": query, "category_type": category,
+                }, timeout=30.0)
 
             items = result.get("results", [])
             # Keep response compact
@@ -85,11 +103,21 @@ def register(mcp: FastMCP, get_connection, cache):
                 if item.get("uri"):
                     entry["uri"] = item["uri"]
                 compact.append(entry)
-            response = json.dumps({
+            resp_obj = {
                 "query": query,
                 "count": len(compact),
                 "results": compact,
-            }, indent=2)
+            }
+            # Surface timing / truncation info so the LLM can adapt
+            if result.get("timed_out"):
+                resp_obj["timed_out"] = True
+                resp_obj["hint"] = (
+                    "Search timed out before completing. Try a more "
+                    "specific query or narrow the category."
+                )
+            if result.get("elapsed_seconds") is not None:
+                resp_obj["elapsed_seconds"] = result["elapsed_seconds"]
+            response = json.dumps(resp_obj, indent=2)
             cache.set(cache_key, response, ttl=30)
             return response
         except Exception as e:

@@ -6,6 +6,7 @@ workflow: creating a track, generating a pattern, and writing it to Ableton.
 import json
 import logging
 import random
+from typing import Union
 from MCP_Server.tools.pattern_generator import (
     generate_from_patterns,
     generate_humanized_drums,
@@ -151,10 +152,14 @@ def register(mcp, get_connection, cache):
 
         Uses get_browser_items_at_path which lists children at one level —
         much faster than search_browser which walks the entire tree recursively.
+
+        Searches up to 2 levels deep. For drums, tries known subpaths where
+        kits actually live (Drums/Drum Rack, Drums/Drum Hits).
         """
-        # Map category to browsable paths
+        # Map category to browsable paths — include known subpaths where
+        # loadable items actually live (they're rarely at the top level)
         if category == "drums":
-            paths = ["Drums"]
+            paths = ["Drums/Drum Rack", "Drums/Drum Hits", "Drums"]
         elif category == "sounds":
             paths = ["Sounds"]
         elif category == "instruments":
@@ -162,9 +167,18 @@ def register(mcp, get_connection, cache):
         elif category == "audio_effects":
             paths = ["Audio Effects"]
         else:
-            paths = ["Drums", "Sounds", "Instruments"]
+            paths = ["Drums/Drum Rack", "Drums/Drum Hits", "Drums",
+                     "Sounds", "Instruments"]
 
         query_lower = str(query).lower()
+
+        def _find_match(items):
+            """Return the first loadable item matching query, or None."""
+            for item in items:
+                name = item.get("name", "")
+                if query_lower in name.lower() and item.get("is_loadable") and item.get("uri"):
+                    return item
+            return None
 
         for browse_path in paths:
             try:
@@ -172,13 +186,33 @@ def register(mcp, get_connection, cache):
                     "path": browse_path,
                 })
                 items = result.get("items", [])
+
+                # Level 1: check items at this path
+                match = _find_match(items)
+                if match:
+                    await conn.send_command("load_browser_item", {
+                        "track_index": track_index, "item_uri": match["uri"],
+                    })
+                    return {"loaded": True, "name": match["name"], "uri": match["uri"]}
+
+                # Level 2: descend into subfolders that are non-loadable folders
                 for item in items:
-                    name = item.get("name", "")
-                    if query_lower in name.lower() and item.get("is_loadable") and item.get("uri"):
-                        await conn.send_command("load_browser_item", {
-                            "track_index": track_index, "item_uri": item["uri"],
-                        })
-                        return {"loaded": True, "name": name, "uri": item["uri"]}
+                    if item.get("is_folder") and not item.get("is_loadable"):
+                        subfolder = "{}/{}".format(browse_path, item["name"])
+                        try:
+                            sub_result = await conn.send_command(
+                                "get_browser_items_at_path", {"path": subfolder},
+                            )
+                            sub_match = _find_match(sub_result.get("items", []))
+                            if sub_match:
+                                await conn.send_command("load_browser_item", {
+                                    "track_index": track_index,
+                                    "item_uri": sub_match["uri"],
+                                })
+                                return {"loaded": True, "name": sub_match["name"],
+                                        "uri": sub_match["uri"]}
+                        except Exception:
+                            continue
             except Exception as exc:
                 logger.warning("Error browsing '%s' for '%s': %s", browse_path, query, exc)
 
@@ -212,7 +246,7 @@ def register(mcp, get_connection, cache):
     async def create_beat(
         style: str = "house",
         bars: int = 4,
-        sound: str = "",
+        sound: Union[str, int] = "",
         track_index: int = -1,
         clip_index: int = 0,
     ) -> str:
@@ -238,6 +272,7 @@ def register(mcp, get_connection, cache):
             clip_index: Clip slot to use (default 0).
         """
         try:
+            sound = str(sound) if sound else ""
             bars = max(1, min(16, bars))
             conn = await get_connection()
             session = await conn.send_command("get_session_info")
@@ -294,7 +329,7 @@ def register(mcp, get_connection, cache):
     async def create_bassline(
         key: str = "C",
         bars: int = 4,
-        sound: str = "",
+        sound: Union[str, int] = "",
         track_index: int = -1,
         clip_index: int = 0,
     ) -> str:
@@ -318,6 +353,7 @@ def register(mcp, get_connection, cache):
             clip_index: Clip slot to use (default 0).
         """
         try:
+            sound = str(sound) if sound else ""
             bars = max(1, min(16, bars))
             conn = await get_connection()
             session = await conn.send_command("get_session_info")
@@ -371,7 +407,7 @@ def register(mcp, get_connection, cache):
         key: str = "C",
         category: str = "synth",
         bars: int = 4,
-        sound: str = "",
+        sound: Union[str, int] = "",
         track_index: int = -1,
         clip_index: int = 0,
     ) -> str:
@@ -393,6 +429,7 @@ def register(mcp, get_connection, cache):
             clip_index: Clip slot to use (default 0).
         """
         try:
+            sound = str(sound) if sound else ""
             valid = {"synth", "keys", "chords", "pads", "melody"}
             if category not in valid:
                 return json.dumps({
@@ -472,7 +509,7 @@ def register(mcp, get_connection, cache):
         progression: str = "I-V-vi-IV",
         bars: int = 4,
         octave: int = 4,
-        sound: str = "",
+        sound: Union[str, int] = "",
         track_index: int = -1,
         clip_index: int = 0,
     ) -> str:
@@ -496,6 +533,7 @@ def register(mcp, get_connection, cache):
             clip_index: Clip slot to use (default 0).
         """
         try:
+            sound = str(sound) if sound else ""
             bars = max(1, min(16, bars))
             conn = await get_connection()
             session = await conn.send_command("get_session_info")
@@ -553,7 +591,7 @@ def register(mcp, get_connection, cache):
     async def create_pad(
         key: str = "C",
         bars: int = 4,
-        sound: str = "",
+        sound: Union[str, int] = "",
         track_index: int = -1,
         clip_index: int = 0,
     ) -> str:
@@ -571,6 +609,7 @@ def register(mcp, get_connection, cache):
             clip_index: Clip slot to use (default 0).
         """
         try:
+            sound = str(sound) if sound else ""
             bars = max(1, min(16, bars))
             conn = await get_connection()
             session = await conn.send_command("get_session_info")
